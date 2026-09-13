@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.spec
+build/
+dist/
+.venv/
+venv/
+
+# Generated manuscript outputs
+*.ris
+*_REPORT.txt
+*_zotero_citations_*.docx
+*_zotero_markers_*.docx
+MISSING_REFERENCES_*.ris
+
+# Local Zotero authorization cache if one is ever placed in the repo
+*zotero*auth*.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
