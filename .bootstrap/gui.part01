@@ -1,0 +1,267 @@
+            return tk.Canvas.configure(self, **kwargs)
+        return None
+
+    config = configure
+
+    def focus_set(self):
+        self.entry.focus_set()
+
+    def bind_entry(self, sequence, func):
+        self.entry.bind(sequence, func)
+
+    def get(self):
+        return self.entry.get()
+
+
+class ModernCheckbox(tk.Frame):
+    def __init__(self, master, text, variable, command=None, **kwargs):
+        tk.Frame.__init__(self, master, bg=master.cget("bg"), bd=0, **kwargs)
+        self.variable = variable
+        self.command = command
+        self._state = "normal"
+        self.box = tk.Canvas(self, width=18, height=18, bg=self.cget("bg"), bd=0,
+                             highlightthickness=0, cursor="hand2")
+        self.box.pack(side="left")
+        self.label = tk.Label(self, text=text, bg=self.cget("bg"), fg=FG,
+                              font=("Segoe UI", 9), cursor="hand2")
+        self.label.pack(side="left", padx=(7, 0))
+        self.box.bind("<Button-1>", self._toggle)
+        self.label.bind("<Button-1>", self._toggle)
+        try:
+            self.variable.trace_add("write", lambda *_args: self._draw())
+        except AttributeError:
+            self.variable.trace("w", lambda *_args: self._draw())
+        self._draw()
+
+    def _toggle(self, _event=None):
+        if self._state == "disabled":
+            return
+        self.variable.set(not bool(self.variable.get()))
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.box.delete("all")
+        selected = bool(self.variable.get())
+        fill = ACCENT if selected and self._state != "disabled" else FIELD
+        border = ACCENT if selected and self._state != "disabled" else BORDER
+        rounded_rect(self.box, 1, 1, 17, 17, 4, fill=border, outline=border)
+        rounded_rect(self.box, 2, 2, 16, 16, 3, fill=fill, outline=fill)
+        if selected:
+            color = "#ffffff" if self._state != "disabled" else SUBTLE
+            self.box.create_line(5, 9, 8, 12, 13, 6, fill=color, width=2,
+                                 capstyle="round", joinstyle="round")
+        self.label.configure(fg=FG if self._state != "disabled" else SUBTLE)
+        cursor = "hand2" if self._state != "disabled" else "arrow"
+        self.box.configure(cursor=cursor)
+        self.label.configure(cursor=cursor)
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            self._draw()
+        if kwargs:
+            return tk.Frame.configure(self, **kwargs)
+        return None
+
+    config = configure
+
+
+class ActivityBar(tk.Canvas):
+    """Indeterminate activity bar that freezes after one step while waiting for input."""
+
+    def __init__(self, master, height=8, **kwargs):
+        tk.Canvas.__init__(self, master, height=height, bg=master.cget("bg"), bd=0,
+                           highlightthickness=0, **kwargs)
+        self.height_px = height
+        self.position = 0.02
+        self.direction = 1
+        self.running = False
+        self.after_id = None
+        self.mode = "idle"
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(20, self.winfo_width())
+        h = self.height_px
+        rounded_rect(self, 0, 0, w - 1, h - 1, 4, fill=FIELD, outline=FIELD)
+        if self.mode == "finished":
+            rounded_rect(self, 0, 0, w - 1, h - 1, 4, fill=SUCCESS, outline=SUCCESS)
+            return
+        if self.mode == "error":
+            rounded_rect(self, 0, 0, w - 1, h - 1, 4, fill=DANGER, outline=DANGER)
+            return
+        if self.mode in ("working", "waiting"):
+            segment = max(42, int(w * 0.18))
+            x = int((w - segment) * self.position)
+            rounded_rect(self, x, 0, min(w - 1, x + segment), h - 1, 4,
+                         fill=ACCENT, outline=ACCENT)
+
+    def start(self):
+        self.mode = "working"
+        self.running = True
+        if self.after_id is None:
+            self._tick()
+
+    def _tick(self):
+        self.after_id = None
+        if not self.running:
+            return
+        self.position += 0.018 * self.direction
+        if self.position >= 1.0:
+            self.position = 1.0
+            self.direction = -1
+        elif self.position <= 0.0:
+            self.position = 0.0
+            self.direction = 1
+        self._draw()
+        self.after_id = self.after(28, self._tick)
+
+    def pause_for_input(self):
+        self.running = False
+        if self.after_id is not None:
+            try:
+                self.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+        # One discrete step, then freeze exactly where it lands.
+        self.position += 0.08 * self.direction
+        if self.position >= 1.0:
+            self.position = 1.0
+            self.direction = -1
+        elif self.position <= 0.0:
+            self.position = 0.0
+            self.direction = 1
+        self.mode = "waiting"
+        self._draw()
+
+    def stop_idle(self):
+        self.running = False
+        if self.after_id is not None:
+            try:
+                self.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+        self.mode = "idle"
+        self.position = 0.02
+        self.direction = 1
+        self._draw()
+
+    def finish(self, ok=True):
+        self.running = False
+        if self.after_id is not None:
+            try:
+                self.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+        self.mode = "finished" if ok else "error"
+        self._draw()
+
+
+class QueueWriter(object):
+    def __init__(self, output_queue):
+        self.output_queue = output_queue
+        self._buffer = ""
+
+    def write(self, text):
+        if not text:
+            return 0
+        self._buffer += str(text)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self.output_queue.put(("log", line + "\n"))
+        return len(text)
+
+    def flush(self):
+        if self._buffer:
+            self.output_queue.put(("log", self._buffer))
+            self._buffer = ""
+
+    def isatty(self):
+        return False
+
+
+class InputRequest(object):
+    def __init__(self, prompt):
+        self.prompt = prompt
+        self.event = threading.Event()
+        self.answer = ""
+
+
+class ZoteroCitationGUI(object):
+    def __init__(self, root):
+        self.root = root
+        self.root.title("{} {}".format(APP_TITLE, APP_VERSION))
+        self.root.geometry("940x900")
+        self.root.minsize(820, 760)
+        self.root.configure(bg=BG)
+
+        self.output_queue = queue.Queue()
+        self.input_queue = queue.Queue()
+        self.running = False
+        self.worker = None
+        self.current_input = None
+        self.prompt_dialog = None
+        self.run_started_at = 0.0
+        self.last_output_docx = None
+        self.last_report = None
+        self.last_ris = None
+        self.recent_log_lines = []
+
+        self.settings = load_gui_settings()
+        self.docx_var = tk.StringVar()
+        self.output_dir_var = tk.StringVar()
+        self.make_ris_var = tk.BooleanVar(value=False)
+        self.make_report_var = tk.BooleanVar(value=False)
+        self.use_collection_var = tk.BooleanVar(value=False)
+        self.collection_name_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Choose a Word document to begin.")
+
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(80, self._poll_queues)
+        if self.settings.get("requirements_notice_version") != REQUIREMENTS_NOTICE_VERSION:
+            self.root.after(250, self._show_first_run_requirements)
+
+    def _build_ui(self):
+        outer = tk.Frame(self.root, bg=BG, padx=20, pady=18)
+        outer.pack(fill="both", expand=True)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(7, weight=1)
+
+        # Header
+        header = tk.Frame(outer, bg=BG)
+        header.grid(row=0, column=0, sticky="ew")
+        tk.Label(header, text=APP_TITLE, bg=BG, fg=FG,
+                 font=("Segoe UI", 19, "bold")).pack(side="left")
+        tk.Label(header, text="v{}".format(APP_VERSION), bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(9, 0), pady=(8, 0))
+        tk.Label(outer,
+                 text="Turn PMID/DOI placeholders into live Zotero citations in Word.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 9)).grid(
+                     row=1, column=0, sticky="w", pady=(3, 14))
+
+        # Inputs are intentionally normal grid-managed panels. They cannot collapse/disappear.
+        input_panel = RoundedPanel(outer, title="Document", radius=8, padding=13)
+        input_panel.grid(row=2, column=0, sticky="ew")
+        input_panel.inner.grid_columnconfigure(0, weight=1)
+        self.docx_entry = RoundedEntry(input_panel.inner, textvariable=self.docx_var)
+        self.docx_entry.grid(row=0, column=0, sticky="ew")
+        self.browse_button = RoundedButton(input_panel.inner, "Browse…", self._browse,
+                                           width=92, height=36, radius=6)
+        self.browse_button.grid(row=0, column=1, padx=(9, 0))
+
+        output_panel = RoundedPanel(outer, title="Output", radius=8, padding=13)
+        output_panel.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        output_panel.inner.grid_columnconfigure(0, weight=1)
+        tk.Label(output_panel.inner, text="Output folder", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.output_dir_entry = RoundedEntry(output_panel.inner, textvariable=self.output_dir_var)
+        self.output_dir_entry.grid(row=1, column=0, sticky="ew", pady=(5, 10))
