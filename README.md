@@ -1,24 +1,15 @@
 # Zotero PMID Tool
 
-Convert PMID and DOI placeholders in a Microsoft Word `.docx` manuscript into **live, editable Zotero Word citations**.
+Convert PMID and DOI references in Microsoft Word `.docx` documents into **live, editable Zotero citations**.
 
-The tool scans document text and Word comments, resolves references against your Zotero library, imports missing references when possible, optionally adds the document's references to a Zotero collection, and writes a new DOCX containing real Zotero citation fields.
+The tool works directly with your Zotero library and creates a new DOCX without overwriting the original.
 
-The original document is never overwritten.
+## What it does
 
-## What it handles
-
-- 6–8 digit PubMed IDs (PMIDs)
-- grouped PMID citations
-- `PMID:`-labeled identifiers
-- DOI citations
-- existing Zotero items
-- missing PubMed references
-- DOI resolution using PubMed/title metadata and Crossref fallback
-- references requested in Word comments
-- optional Zotero collection assignment
-- unresolved references can be ignored so the rest of the manuscript still finishes
-- live `ADDIN ZOTERO_ITEM CSL_CITATION` Word fields
+- **Citations:** Recognizes 6–8 digit PMIDs and DOI references in text, in parentheses, and in Word comments, then replaces them with fully functional Zotero citations.
+- **Reference management:** Automatically recognizes references already in Zotero and imports missing references.
+- **Organization:** Put all references used in the document into a specific Zotero collection, or leave them in My Library.
+- **Optional export:** Create a RIS import file for use with other reference-management software.
 
 ## Requirements
 
