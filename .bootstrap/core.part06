@@ -1,0 +1,273 @@
+            # adjacent Word paragraphs before applying the DOI regex or text from the
+            # next paragraph can accidentally become part of the DOI.
+            for pm in PARA_RE.finditer(xml):
+                collect_from_text(visible_text(pm.group(0)))
+
+        if "word/comments.xml" in z.namelist():
+            comments_xml = z.read("word/comments.xml").decode("utf-8", errors="replace")
+            # Keep comments independent for the same reason.
+            for cm in COMMENT_RE.finditer(comments_xml):
+                collect_from_text(visible_text(cm.group("body")))
+
+    return pmids, dois
+
+def docx_has_zotero_preferences(path):
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            if "docProps/custom.xml" not in z.namelist():
+                return False
+            text = z.read("docProps/custom.xml").decode("utf-8", errors="replace")
+            return "ZOTERO_PREF" in text
+    except Exception:
+        return False
+
+
+def node_text(el):
+    return "" if el is None else "".join(el.itertext()).strip()
+
+
+def clean_ris_text(value):
+    return re.sub(r"\s+", " ", html.unescape(value or "")).strip()
+
+
+def article_to_ris(article):
+    """Convert one PubMed XML article to a Zotero-friendly RIS record."""
+    med = article.find("MedlineCitation")
+    pub = article.find("PubmedData")
+    art = med.find("Article") if med is not None else None
+
+    pmid = node_text(med.find("PMID")) if med is not None else ""
+    title = node_text(art.find("ArticleTitle")) if art is not None else ""
+    journal = ""
+    journal_abbrev = ""
+    year = ""
+    volume = ""
+    issue = ""
+    pages = ""
+    doi = ""
+
+    if art is not None:
+        journal_el = art.find("Journal")
+        if journal_el is not None:
+            journal = node_text(journal_el.find("Title"))
+            ji = journal_el.find("JournalIssue")
+            if ji is not None:
+                volume = node_text(ji.find("Volume"))
+                issue = node_text(ji.find("Issue"))
+                pd = ji.find("PubDate")
+                if pd is not None:
+                    year = node_text(pd.find("Year"))
+                    if not year:
+                        medline_date = node_text(pd.find("MedlineDate"))
+                        m = re.search(r"\b(?:18|19|20)\d{2}\b", medline_date)
+                        year = m.group(0) if m else ""
+        pages = node_text(art.find("Pagination/MedlinePgn"))
+
+    if med is not None:
+        mji = med.find("MedlineJournalInfo")
+        if mji is not None:
+            journal_abbrev = node_text(mji.find("MedlineTA"))
+
+    authors = []
+    if art is not None:
+        for au in art.findall("AuthorList/Author"):
+            group = node_text(au.find("CollectiveName"))
+            if group:
+                authors.append(group)
+                continue
+            last = node_text(au.find("LastName"))
+            fore = node_text(au.find("ForeName"))
+            initials = node_text(au.find("Initials"))
+            if last:
+                authors.append("{}, {}".format(last, fore or initials).strip(", "))
+
+    if pub is not None:
+        for aid in pub.findall("ArticleIdList/ArticleId"):
+            if (aid.attrib.get("IdType") or "").lower() == "doi":
+                doi = node_text(aid)
+                break
+
+    abstract_parts = []
+    if art is not None:
+        for ab in art.findall("Abstract/AbstractText"):
+            label = ab.attrib.get("Label")
+            text = node_text(ab)
+            if text:
+                abstract_parts.append("{}: {}".format(label, text) if label else text)
+
+    lines = ["TY  - JOUR"]
+    for author in authors:
+        lines.append("AU  - {}".format(clean_ris_text(author)))
+    if title:
+        lines.append("TI  - {}".format(clean_ris_text(title)))
+    if journal:
+        lines.append("JO  - {}".format(clean_ris_text(journal)))
+    if journal_abbrev:
+        lines.append("J2  - {}".format(clean_ris_text(journal_abbrev)))
+    if year:
+        lines.append("PY  - {}".format(year))
+    if volume:
+        lines.append("VL  - {}".format(volume))
+    if issue:
+        lines.append("IS  - {}".format(issue))
+    if pages:
+        lines.append("SP  - {}".format(pages))
+    if doi:
+        lines.append("DO  - {}".format(doi))
+    if pmid:
+        lines.append("AN  - PMID:{}".format(pmid))
+        lines.append("UR  - https://pubmed.ncbi.nlm.nih.gov/{}/".format(pmid))
+    if abstract_parts:
+        lines.append("AB  - {}".format(clean_ris_text(" ".join(abstract_parts))))
+    lines.append("ER  -")
+    return "\n".join(lines)
+
+
+
+
+def pubmed_article_to_zotero_item(article):
+    med = article.find("MedlineCitation")
+    pub = article.find("PubmedData")
+    art = med.find("Article") if med is not None else None
+    pmid = node_text(med.find("PMID")) if med is not None else ""
+    title = clean_ris_text(node_text(art.find("ArticleTitle"))) if art is not None else ""
+
+    item = {
+        "itemType": "journalArticle",
+        "title": title,
+        "creators": [],
+        "tags": [],
+        "collections": [],
+        "relations": {},
+    }
+
+    if art is not None:
+        for au in art.findall("AuthorList/Author"):
+            group = clean_ris_text(node_text(au.find("CollectiveName")))
+            if group:
+                item["creators"].append({"creatorType": "author", "name": group})
+                continue
+            last = clean_ris_text(node_text(au.find("LastName")))
+            first = clean_ris_text(node_text(au.find("ForeName")) or node_text(au.find("Initials")))
+            if last:
+                item["creators"].append({
+                    "creatorType": "author",
+                    "firstName": first,
+                    "lastName": last,
+                })
+
+        journal_el = art.find("Journal")
+        if journal_el is not None:
+            journal = clean_ris_text(node_text(journal_el.find("Title")))
+            if journal:
+                item["publicationTitle"] = journal
+            ji = journal_el.find("JournalIssue")
+            if ji is not None:
+                volume = node_text(ji.find("Volume"))
+                issue = node_text(ji.find("Issue"))
+                if volume:
+                    item["volume"] = volume
+                if issue:
+                    item["issue"] = issue
+                pd = ji.find("PubDate")
+                if pd is not None:
+                    year = node_text(pd.find("Year"))
+                    if not year:
+                        md = node_text(pd.find("MedlineDate"))
+                        m = re.search(r"\b(?:18|19|20)\d{2}\b", md)
+                        year = m.group(0) if m else ""
+                    if year:
+                        item["date"] = year
+        pages = node_text(art.find("Pagination/MedlinePgn"))
+        if pages:
+            item["pages"] = pages
+
+        abstract_parts = []
+        for ab in art.findall("Abstract/AbstractText"):
+            label = ab.attrib.get("Label")
+            text = clean_ris_text(node_text(ab))
+            if text:
+                abstract_parts.append("{}: {}".format(label, text) if label else text)
+        if abstract_parts:
+            item["abstractNote"] = " ".join(abstract_parts)
+
+    if med is not None:
+        mji = med.find("MedlineJournalInfo")
+        if mji is not None:
+            abbrev = clean_ris_text(node_text(mji.find("MedlineTA")))
+            if abbrev:
+                item["journalAbbreviation"] = abbrev
+
+    doi = ""
+    if pub is not None:
+        for aid in pub.findall("ArticleIdList/ArticleId"):
+            if (aid.attrib.get("IdType") or "").lower() == "doi":
+                doi = node_text(aid)
+                break
+    if doi:
+        item["DOI"] = doi
+    if pmid:
+        item["url"] = "https://pubmed.ncbi.nlm.nih.gov/{}/".format(pmid)
+        item["extra"] = "PMID: {}".format(pmid)
+
+    return item
+
+
+def fetch_crossref_message(doi):
+    """Fetch metadata for one DOI from Crossref as JSON."""
+    encoded = urllib.parse.quote(normalize_doi(doi), safe="")
+    url = "https://api.crossref.org/works/{}".format(encoded)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "PMID-DOCX-to-Zotero/3.1",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, dict):
+        raise RuntimeError("Crossref returned no metadata for DOI {}".format(doi))
+    return message
+
+
+def crossref_message_to_zotero_item(message, doi):
+    """Convert basic Crossref metadata to a Zotero item payload."""
+    crossref_type = str(message.get("type") or "")
+    item_type = "journalArticle"
+    if crossref_type == "book-chapter":
+        item_type = "bookSection"
+    elif crossref_type in ("book", "monograph", "reference-book"):
+        item_type = "book"
+    elif crossref_type in ("proceedings-article", "proceedings"):
+        item_type = "conferencePaper"
+    elif crossref_type in ("report", "report-series"):
+        item_type = "report"
+
+    titles = message.get("title") or []
+    title = clean_ris_text(titles[0] if titles else "")
+    item = {
+        "itemType": item_type,
+        "title": title,
+        "creators": [],
+        "tags": [],
+        "collections": [],
+        "relations": {},
+        "DOI": normalize_doi(doi),
+    }
+
+    for author in message.get("author") or []:
+        family = clean_ris_text(str(author.get("family") or ""))
+        given = clean_ris_text(str(author.get("given") or ""))
+        name = clean_ris_text(str(author.get("name") or ""))
+        if family:
+            item["creators"].append({
+                "creatorType": "author",
+                "firstName": given,
+                "lastName": family,
+            })
+        elif name:
+            item["creators"].append({"creatorType": "author", "name": name})
+
+    containers = message.get("container-title") or []
