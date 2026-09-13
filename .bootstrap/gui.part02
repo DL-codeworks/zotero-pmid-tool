@@ -1,0 +1,200 @@
+        self.output_browse_button = RoundedButton(output_panel.inner, "Browse…",
+                                                  self._browse_output_dir,
+                                                  width=92, height=36, radius=6)
+        self.output_browse_button.grid(row=1, column=1, padx=(9, 0), pady=(5, 10))
+        tk.Label(output_panel.inner, text="Extra output files", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 8)).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        extra_row = tk.Frame(output_panel.inner, bg=PANEL)
+        extra_row.grid(row=3, column=0, columnspan=2, sticky="w")
+        self.ris_check = ModernCheckbox(extra_row, "PubMed RIS backup/export", self.make_ris_var)
+        self.ris_check.pack(side="left")
+        self.report_check = ModernCheckbox(extra_row, "Conversion report", self.make_report_var)
+        self.report_check.pack(side="left", padx=(24, 0))
+
+        # Optional Zotero collection destination. This is configured inline so
+        # the normal collection choice does not interrupt conversion with a modal.
+        collection_panel = RoundedPanel(outer, title="Zotero collection", radius=8, padding=13)
+        collection_panel.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        collection_panel.inner.grid_columnconfigure(0, weight=1)
+        self.collection_check = ModernCheckbox(
+            collection_panel.inner,
+            "Put references in a collection/folder",
+            self.use_collection_var,
+            command=self._toggle_collection_controls,
+        )
+        self.collection_check.grid(row=0, column=0, sticky="w")
+        tk.Label(
+            collection_panel.inner, text="Collection name or path", bg=PANEL, fg=MUTED,
+            font=("Segoe UI", 8)
+        ).grid(row=1, column=0, sticky="w", pady=(9, 0))
+        self.collection_entry = RoundedEntry(
+            collection_panel.inner, textvariable=self.collection_name_var
+        )
+        self.collection_entry.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        tk.Label(
+            collection_panel.inner,
+            text="Uses a unique existing match automatically. If no collection matches, a new top-level collection is created with this name.",
+            bg=PANEL, fg=SUBTLE, font=("Segoe UI", 8), justify="left", wraplength=820
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self._toggle_collection_controls()
+
+        # Actions + activity indicator
+        action_row = tk.Frame(outer, bg=BG)
+        action_row.grid(row=5, column=0, sticky="ew", pady=(12, 8))
+        self.run_button = RoundedButton(action_row, "Convert Citations", self._start_run,
+                                        accent=True, width=138, height=36, radius=7)
+        self.run_button.pack(side="left")
+        self.open_output_button = RoundedButton(action_row, "Open Output", self._open_output,
+                                                width=104, height=36, radius=7)
+        self.open_output_button.pack(side="left", padx=(8, 0))
+        self.open_output_button.configure(state="disabled")
+        self.open_folder_button = RoundedButton(action_row, "Open Folder", self._open_folder,
+                                                width=104, height=36, radius=7)
+        self.open_folder_button.pack(side="left", padx=(8, 0))
+        self.open_folder_button.configure(state="disabled")
+        self.activity = ActivityBar(action_row, width=200, height=8)
+        self.activity.pack(side="right", padx=(12, 0), pady=(14, 0))
+
+        # Status
+        status_row = tk.Frame(outer, bg=BG)
+        status_row.grid(row=6, column=0, sticky="ew", pady=(0, 9))
+        self.status_dot = tk.Canvas(status_row, width=10, height=10, bg=BG, highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(1, 7), pady=(2, 0))
+        self.status_dot_id = self.status_dot.create_oval(1, 1, 9, 9, fill=MUTED, outline="")
+        tk.Label(status_row, textvariable=self.status_var, bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", anchor="w")
+
+        # Log/progress output. Use a standard frame for maximum cross-platform reliability.
+        log_panel = RoundedPanel(outer, title="Progress", radius=8, padding=10)
+        log_panel.grid(row=7, column=0, sticky="nsew")
+        log_panel.inner.grid_rowconfigure(1, weight=1)
+        log_panel.inner.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            log_panel.inner,
+            text="If nothing is happening, check Zotero for a permissions popup.",
+            bg=PANEL, fg=WARNING, font=("Segoe UI", 8)
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        text_wrap = tk.Frame(log_panel.inner, bg=FIELD, bd=0)
+        text_wrap.grid(row=1, column=0, sticky="nsew")
+        self.log = tk.Text(
+            text_wrap, wrap="word", state="disabled", font=("Cascadia Mono", 9),
+            bg=FIELD, fg=FG, insertbackground=FG, selectbackground=ACCENT,
+            selectforeground="#ffffff", relief="flat", bd=0, padx=10, pady=9
+        )
+        scrollbar = tk.Scrollbar(text_wrap, orient="vertical", command=self.log.yview,
+                                 bg="#2b3038", troughcolor=FIELD, activebackground="#39404b",
+                                 bd=0, highlightthickness=0)
+        self.log.configure(yscrollcommand=scrollbar.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        tk.Label(outer,
+                 text="The original DOCX is never overwritten. Zotero must be open while converting.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=8, column=0, sticky="w", pady=(9, 0))
+
+    def _toggle_collection_controls(self):
+        if not hasattr(self, "collection_entry"):
+            return
+        if self.running:
+            state = "disabled"
+        else:
+            state = "normal" if bool(self.use_collection_var.get()) else "disabled"
+        self.collection_entry.configure(state=state)
+
+    def _browse(self):
+        filename = filedialog.askopenfilename(
+            title="Choose Word manuscript",
+            filetypes=[("Word documents", "*.docx"), ("All files", "*.*")]
+        )
+        if filename:
+            path = Path(filename)
+            self.docx_var.set(str(path))
+            self.output_dir_var.set(str(path.parent))
+            self.status_var.set("Ready to convert.")
+            self._set_status_dot(MUTED)
+
+    def _browse_output_dir(self):
+        initial = self.output_dir_var.get().strip()
+        if not initial and self.docx_var.get().strip():
+            try:
+                initial = str(Path(self.docx_var.get().strip().strip('"')).parent)
+            except Exception:
+                initial = ""
+        folder = filedialog.askdirectory(title="Choose output folder", initialdir=initial or None)
+        if folder:
+            self.output_dir_var.set(folder)
+
+    def _append_log(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+        for line in str(text).splitlines():
+            if line.strip():
+                self.recent_log_lines.append(line.rstrip())
+        self.recent_log_lines = self.recent_log_lines[-80:]
+
+    def _clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self.recent_log_lines = []
+
+    def _show_dark_message(self, title, message, kind="info", button_text="OK", on_close=None):
+        if self.prompt_dialog is not None:
+            return
+        dialog = tk.Toplevel(self.root)
+        self.prompt_dialog = dialog
+        dialog.title(title)
+        dialog.configure(bg=BG)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        shell = tk.Frame(dialog, bg=BG, padx=14, pady=14)
+        shell.pack(fill="both", expand=True)
+        card = RoundedPanel(shell, radius=9, padding=18)
+        card.pack(fill="both", expand=True)
+        title_color = DANGER if kind == "error" else (WARNING if kind == "warning" else FG)
+        tk.Label(card.inner, text=title, bg=PANEL, fg=title_color,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(card.inner, text=message, bg=PANEL, fg=MUTED, justify="left",
+                 wraplength=590, font=("Segoe UI", 9)).pack(anchor="w", fill="x", pady=(9, 16))
+
+        def close_dialog():
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            self.prompt_dialog = None
+            if on_close:
+                on_close()
+
+        btn = RoundedButton(card.inner, button_text, close_dialog, accent=True,
+                            width=max(82, 18 + tkfont.Font(family="Segoe UI", size=9, weight="bold").measure(button_text)),
+                            height=34, radius=6)
+        btn.pack(anchor="e")
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        self._center_dialog(dialog)
+
+    def _start_run(self):
+        if self.running:
+            return
+        raw = self.docx_var.get().strip().strip('"')
+        path = Path(raw).expanduser() if raw else None
+        if path is None or not path.exists() or path.suffix.lower() != ".docx":
+            self._show_dark_message(APP_TITLE, "Choose an existing .docx file first.", kind="error")
+            return
+
+        raw_output = self.output_dir_var.get().strip().strip('"')
+        output_dir = Path(raw_output).expanduser() if raw_output else path.parent
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._show_dark_message(APP_TITLE,
+                                    "Could not create/access the output folder:\n{}".format(exc),
+                                    kind="error")
+            return
+        if not output_dir.is_dir():
