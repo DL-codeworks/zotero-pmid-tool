@@ -14,14 +14,10 @@ The original document is never overwritten.
 ## Requirements
 
 - Windows
-- Microsoft Word
-- Zotero 10 or newer
-- Zotero Word integration installed
-- Zotero open while the tool runs
+- Microsoft Word with the Zotero add-on
+- Zotero 10 or newer, open while the tool runs
 - In Zotero: **Settings → Advanced → Allow other applications on this computer to communicate with Zotero**
 - On first use, choose **Always Allow** when Zotero asks for permission
-
-The packaged EXE does not require Python.
 
 ## Use
 
@@ -32,17 +28,9 @@ The packaged EXE does not require Python.
 5. Click **Convert Citations**.
 6. Open the newly created DOCX.
 
-Unresolved references can be ignored so the rest of the document still finishes.
-
 ## Output
 
-The converted DOCX is always created. RIS and report files are optional.
-
-```text
-My Chapter_zotero_citations_20260911_123456.docx
-My Chapter_zotero_citations_20260911_123456_REPORT.txt
-My Chapter_pubmed_citations_20260911_123456.ris
-```
+A new copy of the DOCX is created; the original document is left untouched. RIS and report files are optional.
 
 ## Source
 
