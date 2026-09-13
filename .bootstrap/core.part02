@@ -1,0 +1,236 @@
+                hits.append((str(name), path, key, prefix))
+    return hits
+
+
+def _extract_created_key(obj):
+    if not isinstance(obj, dict):
+        return None
+    success = obj.get("successful") or obj.get("success") or {}
+    saved = success.get("0") if isinstance(success, dict) else None
+    if isinstance(saved, str):
+        return saved
+    if isinstance(saved, dict):
+        return saved.get("key") or (saved.get("data") or {}).get("key")
+    return None
+
+
+def create_zotero_collection(name, parent_key=None):
+    """Create one collection in My Library and return (key, data)."""
+    name = str(name or "").strip()
+    if not name:
+        raise RuntimeError("Collection name cannot be blank.")
+
+    # Never create a duplicate exact-name top-level collection silently.
+    for path, key in zotero_collection_paths():
+        if path.casefold() == name.casefold():
+            data = _get_collection_data(key)
+            if data:
+                return key, data
+
+    server_id = zotero_server_id()
+    if not server_id:
+        raise RuntimeError("This Zotero version does not support local API writes.")
+    api_key = zotero_write_key(server_id)
+    payload = [{"name": name, "parentCollection": parent_key or False}]
+    token = uuid.uuid4().hex
+
+    for attempt in range(2):
+        obj, _headers, status, _elapsed = zotero_raw_request(
+            "POST",
+            "/users/0/collections",
+            payload=payload,
+            api_key=api_key,
+            server_id=server_id,
+            extra_headers={"Zotero-Write-Token": token},
+            timeout=60,
+        )
+        if status == 401 and attempt == 0:
+            clear_cached_write_key()
+            api_key = authorize_zotero_write(server_id)
+            continue
+        if status == 409:
+            raise RuntimeError("Zotero says My Library is locked/busy while creating the collection (HTTP 409).")
+        if status >= 400:
+            raise RuntimeError("Zotero could not create collection {!r} (HTTP {}): {}".format(name, status, obj))
+        key = _extract_created_key(obj)
+        if not key:
+            raise RuntimeError("Zotero returned success but no collection key: {}".format(obj))
+        data = _get_collection_data(key)
+        if not data:
+            raise RuntimeError("Zotero created collection key {} but it could not be read back.".format(key))
+        return key, data
+    raise RuntimeError("Could not authorize collection creation.")
+
+
+def resolve_requested_collection(name):
+    """Resolve a GUI/CLI-supplied collection name without interactive prompts.
+
+    Resolution order:
+      1. exact full-path match (case-insensitive)
+      2. unique exact leaf-name match
+      3. unique substring match
+      4. no match -> create a new top-level My Library collection
+
+    Ambiguous matches raise CollectionSelectionError so the caller can ask the
+    user to type a more specific/full path rather than silently choosing one.
+    """
+    requested = str(name or "").strip()
+    if not requested:
+        return None, None
+
+    try:
+        paths = zotero_collection_paths()
+    except Exception as exc:
+        raise CollectionSelectionError(
+            "Could not read My Library collections from Zotero: {}".format(exc)
+        )
+
+    needle = requested.casefold()
+    exact_path = [(path, key) for path, key in paths if path.casefold() == needle]
+    if len(exact_path) == 1:
+        matches = exact_path
+    else:
+        exact_leaf = [
+            (path, key) for path, key in paths
+            if path.rsplit(" / ", 1)[-1].casefold() == needle
+        ]
+        if len(exact_leaf) == 1:
+            matches = exact_leaf
+        elif len(exact_leaf) > 1:
+            matches = exact_leaf
+        else:
+            partial = [(path, key) for path, key in paths if needle in path.casefold()]
+            matches = partial
+
+    if len(matches) == 1:
+        path, key = matches[0]
+        data = _get_collection_data(key, "/users/0")
+        if not data:
+            raise CollectionSelectionError(
+                "Zotero no longer reports collection {!r} [key {}]. Try again.".format(path, key)
+            )
+        print("Using collection: {}".format(path))
+        return key, path
+
+    if len(matches) > 1:
+        preview = "\n".join("  - {}".format(path) for path, _key in matches[:12])
+        if len(matches) > 12:
+            preview += "\n  ... and {} more".format(len(matches) - 12)
+        raise CollectionSelectionError(
+            "Collection name/path {!r} matches more than one Zotero collection. "
+            "Use a more specific name or the full collection path.\n{}".format(requested, preview)
+        )
+
+    # No match: this inline GUI field doubles as the new-collection name.
+    # Do not interpret a path-looking value as nested structure; creating nested
+    # collections requires an explicit parent key. Keep creation predictable.
+    if " / " in requested:
+        raise CollectionSelectionError(
+            "No existing collection matched {!r}. Because that looks like a collection path, "
+            "it was not created automatically. Use an existing full path or enter a simple name "
+            "for a new top-level collection.".format(requested)
+        )
+    try:
+        key, data = create_zotero_collection(requested)
+    except Exception as exc:
+        raise CollectionSelectionError(
+            "No existing collection matched {!r}, and Zotero could not create it: {}".format(requested, exc)
+        )
+    display = str(data.get("name") or requested)
+    print("Created and using collection: {}".format(display))
+    return key, display
+
+
+def choose_import_collection():
+    """Return (collection_key, display_path), or (None, None) for My Library only."""
+    print("\nDo you want to put references in a specific collection/folder?")
+    print("[Enter] No (they go into My Library)")
+    print("[E] Yes, to an existing collection")
+    print("[N] Yes, to a new collection")
+    choice = input("Choice: ").strip().lower()
+    if not choice:
+        return None, None
+
+    if choice in ("n", "new", "create"):
+        name = input("New collection name: ").strip()
+        if not name:
+            print("No collection created.")
+            return None, None
+        try:
+            key, data = create_zotero_collection(name)
+        except Exception as exc:
+            print("Could not create Zotero collection: {}".format(exc))
+            return None, None
+        print("Using My Library collection: {} [key {}]".format(data.get("name") or name, key))
+        return key, str(data.get("name") or name)
+
+    if choice not in ("e", "existing", "c", "collection", "folder"):
+        print("Unrecognized collection choice; leaving membership unchanged.")
+        return None, None
+
+    try:
+        paths = zotero_collection_paths()
+    except Exception as exc:
+        print("Could not read My Library collections: {}".format(exc))
+        return None, None
+    if not paths:
+        print("No collections exist in My Library.")
+        return None, None
+
+    while True:
+        query_raw = input("Type part of the existing collection name/path (blank = show all, / = cancel): ").strip()
+        if query_raw == "/":
+            return None, None
+        query = query_raw.casefold()
+        matches = [(path, key) for path, key in paths if not query or query in path.casefold()]
+        if not matches:
+            print("No matching collection was returned by Zotero in My Library.")
+            group_hits = _group_collection_hits(query_raw)
+            if group_hits:
+                print("However, Zotero reports matching collection(s) in GROUP libraries:")
+                for group_name, path, key, _prefix in group_hits[:20]:
+                    print("  Group {!r}: {} [key {}]".format(group_name, path, key))
+                print("A My Library item cannot use a group-library collection key. Group-library copying is a separate operation.")
+            print("Try another search, or choose / to cancel.")
+            continue
+        if len(matches) > 60:
+            print("{} matches; type a more specific search.".format(len(matches)))
+            continue
+
+        # A unique search result is unambiguous: validate it and use it immediately.
+        if len(matches) == 1:
+            path, key = matches[0]
+            data = _get_collection_data(key, "/users/0")
+            if not data:
+                print("Zotero no longer reports collection key {} in My Library. Refreshing the collection list.".format(key))
+                paths = zotero_collection_paths()
+                continue
+            actual_name = str(data.get("name") or "").strip()
+            print("Using existing collection: {}".format(path))
+            if actual_name and actual_name not in path:
+                print("Zotero reports collection name: {}".format(actual_name))
+            return key, path
+
+        for i, (path, key) in enumerate(matches, 1):
+            print("  {:>2}. {}  [key {}]".format(i, path, key))
+        raw = input("Choose collection number, or Enter to cancel: ").strip()
+        if not raw:
+            return None, None
+        try:
+            number = int(raw)
+        except ValueError:
+            print("Enter a number from the list.")
+            continue
+        if 1 <= number <= len(matches):
+            path, key = matches[number - 1]
+            # Validate the exact key immediately before any writes.
+            data = _get_collection_data(key, "/users/0")
+            if not data:
+                print("Zotero no longer reports collection key {} in My Library. Refreshing the collection list.".format(key))
+                paths = zotero_collection_paths()
+                continue
+            actual_name = str(data.get("name") or "").strip()
+            print("Validated My Library collection: {} [key {}]".format(path, key))
+            if actual_name and actual_name not in path:
+                print("Zotero reports collection name: {}".format(actual_name))
+            return key, path
