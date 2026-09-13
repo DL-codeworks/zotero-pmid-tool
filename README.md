@@ -2,6 +2,8 @@
 
 A Windows tool for managing Zotero references in `.docx` documents. It automatically imports PubMed PMID and DOI references into Zotero and replaces the identifiers in the document with fully functional Zotero citations.
 
+**Just want to use the tool?** Download the latest Windows `.exe` from [Releases](https://github.com/DL-codeworks/zotero-pmid-tool/releases) and follow the [Use](#use) instructions below. The **Source** and **Build** sections are only for developers.
+
 The original document is never overwritten.
 
 ## Features
