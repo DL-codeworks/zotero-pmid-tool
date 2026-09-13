@@ -1,0 +1,115 @@
+        if self.prompt_dialog is not None:
+            try:
+                self.prompt_dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                self.prompt_dialog.destroy()
+            except Exception:
+                pass
+            self.prompt_dialog = None
+        request.event.set()
+        self.status_var.set("Processing…")
+        self._set_status_dot(ACCENT)
+        self.activity.start()
+
+    def _hide_input(self):
+        if self.prompt_dialog is not None:
+            try:
+                self.prompt_dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                self.prompt_dialog.destroy()
+            except Exception:
+                pass
+            self.prompt_dialog = None
+        self.current_input = None
+
+    def _finish_run(self, result, input_path):
+        self.running = False
+        self._set_controls_enabled(True)
+        self._hide_input()
+        self._discover_outputs(input_path)
+        ok = bool(result.get("ok"))
+        self.activity.finish(ok=ok)
+
+        if self.last_output_docx and self.last_output_docx.exists():
+            self.open_output_button.configure(state="normal")
+            self.open_folder_button.configure(state="normal")
+
+        if ok and self.last_output_docx:
+            self.status_var.set("Finished successfully.")
+            self._set_status_dot(SUCCESS)
+            self._show_dark_message(
+                APP_TITLE,
+                "Finished.\n\nCreated:\n{}".format(self.last_output_docx),
+                kind="info"
+            )
+        elif ok:
+            self.status_var.set("Finished.")
+            self._set_status_dot(SUCCESS)
+        else:
+            self.status_var.set("Stopped with an error.")
+            self._set_status_dot(DANGER)
+            message = result.get("message") or "The conversion stopped with an error. See the progress log."
+            self._show_dark_message(APP_TITLE, message, kind="error")
+
+    def _discover_outputs(self, input_path):
+        raw_output = self.output_dir_var.get().strip().strip('"')
+        folder = Path(raw_output) if raw_output else input_path.parent
+        stem = input_path.stem
+
+        def newest(pattern):
+            candidates = []
+            for path in folder.glob(pattern):
+                try:
+                    if path.stat().st_mtime >= self.run_started_at - 2:
+                        candidates.append(path)
+                except OSError:
+                    pass
+            return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+
+        self.last_output_docx = newest(stem + "_zotero_citations_*.docx")
+        self.last_report = newest(stem + "_zotero_citations_*_REPORT.txt") if self.make_report_var.get() else None
+        self.last_ris = newest(stem + "_pubmed_citations_*.ris") if self.make_ris_var.get() else None
+
+    def _open_output(self):
+        if self.last_output_docx and self.last_output_docx.exists():
+            try:
+                os.startfile(str(self.last_output_docx))
+            except AttributeError:
+                self._show_dark_message(APP_TITLE, str(self.last_output_docx))
+            except OSError as exc:
+                self._show_dark_message(APP_TITLE, "Could not open output:\n{}".format(exc), kind="error")
+
+    def _open_folder(self):
+        if self.last_output_docx:
+            path = self.last_output_docx
+        elif self.output_dir_var.get().strip():
+            path = Path(self.output_dir_var.get().strip().strip('"'))
+        else:
+            path = Path(self.docx_var.get()).parent if self.docx_var.get() else None
+        if not path:
+            return
+        folder = path.parent if path.suffix else path
+        try:
+            os.startfile(str(folder))
+        except AttributeError:
+            self._show_dark_message(APP_TITLE, str(folder))
+        except OSError as exc:
+            self._show_dark_message(APP_TITLE, "Could not open folder:\n{}".format(exc), kind="error")
+
+    def _show_first_run_requirements(self):
+        if self.prompt_dialog is not None:
+            return
+        dialog = tk.Toplevel(self.root)
+        self.prompt_dialog = dialog
+        dialog.title("Before you start")
+        dialog.configure(bg=BG)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        shell = tk.Frame(dialog, bg=BG, padx=14, pady=14)
+        shell.pack(fill="both", expand=True)
