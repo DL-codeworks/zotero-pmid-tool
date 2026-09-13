@@ -1,0 +1,117 @@
+        card = RoundedPanel(shell, radius=9, padding=18)
+        card.pack(fill="both", expand=True)
+
+        tk.Label(
+            card.inner, text="Zotero PMID Tool requirements",
+            bg=PANEL, fg=FG, font=("Segoe UI", 14, "bold")
+        ).pack(anchor="w")
+
+        text = (
+            "1. In Zotero, go to Settings → Advanced and enable:\n"
+            "   ‘Allow other applications on this computer to communicate with Zotero.’\n\n"
+            "2. On your first run of this tool Zotero will ask you for permission to "
+            "communicate with this app with a popup. Choose Always Allow.\n\n"
+            "This tool will create a new copy of your file. The original DOCX is never overwritten."
+        )
+        tk.Label(
+            card.inner, text=text, bg=PANEL, fg=MUTED, justify="left",
+            wraplength=610, font=("Segoe UI", 9)
+        ).pack(anchor="w", fill="x", pady=(12, 16))
+
+        dont_show_var = tk.BooleanVar(value=False)
+        dont_show = ModernCheckbox(card.inner, "Don't show this again", dont_show_var)
+        dont_show.pack(anchor="w", pady=(0, 16))
+
+        def close_dialog(save_choice=False):
+            if save_choice and bool(dont_show_var.get()):
+                self.settings["requirements_notice_version"] = REQUIREMENTS_NOTICE_VERSION
+                save_gui_settings(self.settings)
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            self.prompt_dialog = None
+
+        RoundedButton(
+            card.inner, "Continue", lambda: close_dialog(save_choice=True),
+            accent=True, width=92, height=34, radius=6
+        ).pack(anchor="e")
+
+        # Closing the window dismisses the notice for this launch only.
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog(save_choice=False))
+        self._center_dialog(dialog)
+
+    def _center_dialog(self, dialog):
+        dialog.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+            dialog.geometry("+{}+{}".format(max(0, x), max(0, y)))
+        except Exception:
+            pass
+
+    def _set_status_dot(self, color):
+        try:
+            self.status_dot.itemconfigure(self.status_dot_id, fill=color)
+        except Exception:
+            pass
+
+    def _on_close(self):
+        if self.running:
+            self._show_confirm_close()
+            return
+        self.root.destroy()
+
+    def _show_confirm_close(self):
+        if self.prompt_dialog is not None:
+            return
+        dialog = tk.Toplevel(self.root)
+        self.prompt_dialog = dialog
+        dialog.title("Conversion running")
+        dialog.configure(bg=BG)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        shell = tk.Frame(dialog, bg=BG, padx=14, pady=14)
+        shell.pack(fill="both", expand=True)
+        card = RoundedPanel(shell, radius=9, padding=18)
+        card.pack(fill="both", expand=True)
+        tk.Label(card.inner, text="A conversion is still running", bg=PANEL, fg=WARNING,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(card.inner,
+                 text="Closing now will stop the application. Do you want to close anyway?",
+                 bg=PANEL, fg=MUTED, justify="left", wraplength=520,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(9, 15))
+        row = tk.Frame(card.inner, bg=PANEL)
+        row.pack(fill="x")
+
+        def cancel():
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            self.prompt_dialog = None
+
+        def close_now():
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            self.root.destroy()
+
+        RoundedButton(row, "Keep running", cancel, accent=True, height=34, radius=6).pack(side="left")
+        RoundedButton(row, "Close anyway", close_now, height=34, radius=6).pack(side="left", padx=(8, 0))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        self._center_dialog(dialog)
+
+
+def main():
+    root = tk.Tk()
+    ZoteroCitationGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
