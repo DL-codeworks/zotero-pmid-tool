@@ -1,0 +1,258 @@
+                        created += 1
+                        done = True
+                        break
+                if attempt < max_attempts:
+                    delay = 2 ** attempt
+                    write_event("Retrying {} in {}s.".format(label, delay))
+                    time.sleep(delay)
+                    continue
+                failures.append((label, message))
+                break
+
+            write_event("Zotero answered HTTP {} in {:.2f}s for {}.".format(status, elapsed, label))
+
+            if status == 401:
+                write_event("Zotero rejected the cached write authorization; requesting a fresh one.")
+                clear_cached_write_key()
+                key = authorize_zotero_write(server_id)
+                if attempt < max_attempts:
+                    continue
+                failures.append((label, "HTTP 401 after reauthorization"))
+                break
+
+            if status == 409:
+                write_event("Zotero reports the library is locked/busy (HTTP 409).")
+                if attempt < max_attempts:
+                    delay = 2 ** attempt
+                    write_event("Waiting {}s before retrying {}.".format(delay, label))
+                    time.sleep(delay)
+                    continue
+                failures.append((label, "HTTP 409 library locked"))
+                break
+
+            if status == 412:
+                # Reusing the same write token after a lost response can produce 412
+                # because Zotero already accepted the first request. Verify first.
+                write_event("Zotero returned HTTP 412; checking whether the earlier write already succeeded.")
+                try:
+                    found = _find_payload_in_zotero(item)
+                except Exception as verify_exc:
+                    found = None
+                    write_event("Verification check failed: {}".format(verify_exc))
+                if found:
+                    write_event("{} is present in Zotero; no duplicate retry needed.".format(label))
+                    created += 1
+                    done = True
+                    break
+                token = uuid.uuid4().hex
+                if attempt < max_attempts:
+                    continue
+                failures.append((label, "HTTP 412 and item not found after verification"))
+                break
+
+            if status >= 500:
+                write_event("Zotero returned a server error for {}: HTTP {} {}".format(label, status, obj))
+                if attempt < max_attempts:
+                    delay = 2 ** attempt
+                    time.sleep(delay)
+                    continue
+                failures.append((label, "HTTP {}: {}".format(status, obj)))
+                break
+
+            if status >= 400:
+                failures.append((label, "HTTP {}: {}".format(status, obj)))
+                write_event("Zotero rejected {}: HTTP {} {}".format(label, status, obj))
+                break
+
+            success = {}
+            failed = {}
+            if isinstance(obj, dict):
+                success = obj.get("success") or obj.get("successful") or {}
+                failed = obj.get("failed") or {}
+            if failed:
+                failures.append((label, "Zotero item failure: {}".format(failed)))
+                write_event("Zotero rejected {}: {}".format(label, failed))
+                break
+            if success:
+                created += 1
+                write_event("Added {} to Zotero.".format(label))
+                done = True
+                break
+
+            # A successful HTTP response without a recognizable body is ambiguous.
+            write_event("Zotero returned HTTP {} but no recognizable item result; verifying library state.".format(status))
+            try:
+                found = _find_payload_in_zotero(item)
+            except Exception as verify_exc:
+                found = None
+                write_event("Verification check failed: {}".format(verify_exc))
+            if found:
+                created += 1
+                write_event("{} is present in Zotero.".format(label))
+                done = True
+                break
+            if attempt < max_attempts:
+                delay = 2 ** attempt
+                time.sleep(delay)
+                continue
+            failures.append((label, "HTTP {} without success result, item not found".format(status)))
+            break
+
+        if not done and failures and failures[-1][0] == label:
+            write_event("Giving up automatic import for {} after {} attempt(s); the rest of the document will continue.".format(label, max_attempts))
+
+    return created, failures
+
+def zotero_get(path):
+    req = urllib.request.Request(
+        ZOTERO_API + path,
+        headers={"User-Agent": "PMID-DOCX-to-Zotero/1.0", "Zotero-API-Version": "3", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8")), dict(response.headers.items())
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            sys.exit("Zotero returned 403. Enable Settings -> Advanced -> Allow other applications on this computer to communicate with Zotero.")
+        raise
+    except urllib.error.URLError as e:
+        sys.exit(f"Could not connect to Zotero at localhost:23119. Make sure Zotero is open.\n{e}")
+
+
+def load_all_zotero_items():
+    items = []
+    start = 0
+    limit = 100
+    while True:
+        batch, headers = zotero_get(f"/users/0/items/top?format=json&limit={limit}&start={start}")
+        if not batch:
+            break
+        items.extend(batch)
+        start += len(batch)
+        total = headers.get("Total-Results") or headers.get("total-results")
+        if total:
+            try:
+                if start >= int(total):
+                    break
+            except ValueError:
+                pass
+        if len(batch) < limit:
+            break
+    return items
+
+
+def load_all_zotero_collections(prefix="/users/0"):
+    """Return all collections for one Zotero library prefix.
+
+    The local API is not paginated by default, so one request is sufficient.
+    We keep the prefix explicit because collection keys are only valid inside
+    the library they belong to.
+    """
+    obj, _headers, status, _elapsed = zotero_raw_request(
+        "GET", prefix + "/collections?format=json", timeout=20
+    )
+    if status >= 400:
+        raise RuntimeError("Could not read Zotero collections from {} (HTTP {}): {}".format(prefix, status, obj))
+    if not isinstance(obj, list):
+        raise RuntimeError("Unexpected Zotero collections response from {}: {}".format(prefix, obj))
+    return obj
+
+
+def _collection_entries(prefix="/users/0"):
+    entries = {}
+    for obj in load_all_zotero_collections(prefix):
+        data = obj.get("data") or {}
+        key = data.get("key") or obj.get("key")
+        name = str(data.get("name") or "").strip()
+        parent = data.get("parentCollection") or None
+        if key and name:
+            entries[key] = {"key": key, "name": name, "parent": parent, "prefix": prefix}
+    return entries
+
+
+def _collection_paths_for_prefix(prefix="/users/0"):
+    entries = _collection_entries(prefix)
+    cache = {}
+
+    def path_for(key, trail=None):
+        if key in cache:
+            return cache[key]
+        if key not in entries:
+            return ""
+        trail = set(trail or ())
+        if key in trail:
+            return entries[key]["name"]
+        trail.add(key)
+        parent = entries[key]["parent"]
+        if parent and parent in entries:
+            parent_path = path_for(parent, trail)
+            path = (parent_path + " / " if parent_path else "") + entries[key]["name"]
+        else:
+            path = entries[key]["name"]
+        cache[key] = path
+        return path
+
+    out = []
+    for key in entries:
+        out.append((path_for(key), key))
+    out.sort(key=lambda x: x[0].casefold())
+    return out
+
+
+def zotero_collection_paths():
+    """Personal-library collection paths only.
+
+    References resolved by this tool live in My Library, so their collection
+    membership must also point to a My Library collection key. Group-library
+    collections are a different library and cannot be used as membership keys
+    on My Library items.
+    """
+    return _collection_paths_for_prefix("/users/0")
+
+
+def _get_collection_data(collection_key, prefix="/users/0"):
+    obj, _headers, status, _elapsed = zotero_raw_request(
+        "GET", prefix + "/collections/{}?format=json".format(collection_key), timeout=20
+    )
+    if status == 404:
+        return None
+    if status >= 400:
+        raise RuntimeError(
+            "Could not read Zotero collection {} from {} (HTTP {}): {}".format(
+                collection_key, prefix, status, obj
+            )
+        )
+    if isinstance(obj, dict):
+        data = obj.get("data")
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _group_collection_hits(query):
+    """Diagnostic only: find same-named collections in group libraries."""
+    hits = []
+    try:
+        groups, _headers, status, _elapsed = zotero_raw_request(
+            "GET", "/users/0/groups?format=json", timeout=20
+        )
+    except Exception:
+        return hits
+    if status >= 400 or not isinstance(groups, list):
+        return hits
+
+    q = (query or "").casefold()
+    for g in groups:
+        data = g.get("data") if isinstance(g, dict) else None
+        data = data if isinstance(data, dict) else (g if isinstance(g, dict) else {})
+        gid = data.get("id") or data.get("groupID") or g.get("id") or g.get("groupID")
+        name = data.get("name") or g.get("name") or "Group {}".format(gid)
+        if gid is None:
+            continue
+        prefix = "/groups/{}".format(gid)
+        try:
+            paths = _collection_paths_for_prefix(prefix)
+        except Exception:
+            continue
+        for path, key in paths:
+            if not q or q in path.casefold():
