@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+import argparse
+import difflib
+import html
+import json
+import os
+import random
+import socket
+import re
+import string
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
+
+ZOTERO_API = os.environ.get("ZOTERO_API", "http://localhost:23119/api")
+EUTILS_FETCH = os.environ.get("EUTILS_FETCH", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi")
+EUTILS_SEARCH = os.environ.get("EUTILS_SEARCH", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi")
+
+PMID_RE = re.compile(r"(?<!\d)(\d{6,8})(?!\d)")
+PMID_LABELED_RE = re.compile(r"\b(?:PMID|PubMed(?:\s+ID)?)\s*:?\s*(\d{6,8})\b", re.I)
+PUBMED_URL_RE = re.compile(r"https?://(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov/(\d{6,8})(?:/|$)", re.I)
+DOI_RE = re.compile(
+    r"(?:(?:https?://(?:dx\.)?doi\.org/)|(?:doi\s*:\s*))?"
+    r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.I
+)
+WT_RE = re.compile(r"(<w:t\b(?![^>]*?/>)[^>]*>)(.*?)(</w:t>)", re.S)
+PARA_RE = re.compile(r"<w:p\b[\s\S]*?</w:p>")
+COMMENT_RE = re.compile(r'<w:comment\b[^>]*\bw:id="(?P<id>\d+)"[^>]*>(?P<body>[\s\S]*?)</w:comment>')
+
+WRITE_EVENTS = []
+
+
+def write_event(message):
+    stamp = datetime.now().strftime("%H:%M:%S")
+    line = "[{}] {}".format(stamp, message)
+    WRITE_EVENTS.append(line)
+    print(line)
+
+
+class ZoteroRef(object):
+    def __init__(self, key, label, title, uri, data=None, item=None):
+        self.key = key
+        self.label = label
+        self.title = title or ""
+        self.uri = uri
+        self.data = data or {}
+        self.item = item or {}
+
+
+class Replacement(object):
+    def __init__(self, start, end, refs, identifiers, trailing_text=""):
+        self.start = start
+        self.end = end
+        self.refs = refs
+        self.identifiers = identifiers
+        self.trailing_text = trailing_text
+
+
+class CollectionSelectionError(RuntimeError):
+    pass
+
+
+def _trim_doi_value(value):
+    value = html.unescape(value or "").strip()
+    value = value.rstrip(".,;")
+    while value.endswith(")") and value.count(")") > value.count("("):
+        value = value[:-1].rstrip()
+    while value.endswith("]") and value.count("]") > value.count("["):
+        value = value[:-1].rstrip()
+    return value
+
+
+def normalize_doi(value):
+    value = html.unescape(value or "").strip()
+    value = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value, flags=re.I)
+    value = re.sub(r"^doi\s*:\s*", "", value, flags=re.I)
+    return _trim_doi_value(value).lower()
+
+
+def visible_text(xml_fragment):
+    return "".join(html.unescape(m.group(2)) for m in WT_RE.finditer(xml_fragment))
+
+
+
+
+def _decode_response_body(raw):
+    if not raw:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def zotero_raw_request(method, path, payload=None, api_key=None, server_id=None, extra_headers=None, timeout=20):
+    headers = {
+        "User-Agent": "PMID-DOCX-to-Zotero/5.0",
+        "Zotero-API-Version": "3",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["Zotero-API-Key"] = api_key
+    if server_id:
+        headers["Zotero-Server-ID"] = server_id
+    if extra_headers:
+        headers.update(extra_headers)
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(ZOTERO_API + path, data=data, headers=headers, method=method)
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+            return _decode_response_body(raw), dict(response.headers.items()), response.status, time.monotonic() - started
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        return _decode_response_body(raw), dict(e.headers.items()), e.code, time.monotonic() - started
+    except (socket.timeout, TimeoutError) as e:
+        raise RuntimeError("TIMEOUT after {:.1f}s waiting for Zotero {} {}".format(time.monotonic() - started, method, path))
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, socket.timeout):
+            raise RuntimeError("TIMEOUT after {:.1f}s waiting for Zotero {} {}".format(time.monotonic() - started, method, path))
+        raise RuntimeError("Could not connect to Zotero at localhost:23119. Make sure Zotero is open.\n{}".format(e))
+
+
+def zotero_server_id():
+    obj, headers, status, elapsed = zotero_raw_request("GET", "/")
+    if status == 403:
+        raise RuntimeError("Enable Zotero -> Settings -> Advanced -> Allow other applications on this computer to communicate with Zotero.")
+    if status >= 400:
+        raise RuntimeError("Could not read Zotero local API (HTTP {}).".format(status))
+    server_id = headers.get("Zotero-Server-ID") or headers.get("zotero-server-id")
+    if not server_id:
+        return None
+    return server_id
+
+
+def app_data_dir():
+    """Persistent per-user storage that also works from a PyInstaller one-file EXE."""
+    base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    if base:
+        folder = Path(base) / "ZoteroPMIDTool"
+    else:
+        folder = Path.home() / ".zotero_pmid_tool"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return folder
+
+
+def auth_cache_path():
+    return app_data_dir() / "zotero_local_write_auth.json"
+
+
+def load_cached_write_key(server_id):
+    try:
+        data = json.loads(auth_cache_path().read_text(encoding="utf-8"))
+        if data.get("server_id") == server_id and data.get("key"):
+            return data["key"]
+    except Exception:
+        pass
+    return None
+
+
+def save_cached_write_key(server_id, key):
+    try:
+        auth_cache_path().write_text(
+            json.dumps({"server_id": server_id, "key": key}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def clear_cached_write_key():
+    try:
+        auth_cache_path().unlink()
+    except OSError:
+        pass
+
+
+def authorize_zotero_write(server_id):
+    obj, headers, status, elapsed = zotero_raw_request(
+        "POST",
+        "/local/authorize",
+        payload={"appName": "Zotero PMID Tool"},
+        server_id=server_id,
+        timeout=60,
+    )
+    if status == 403:
+        raise RuntimeError("Zotero write authorization was denied.")
+    if status == 404 or status == 405:
+        raise RuntimeError("This Zotero version does not support local API writes.")
+    if status >= 400 or not isinstance(obj, dict) or not obj.get("key"):
+        raise RuntimeError("Could not authorize Zotero writes (HTTP {}): {}".format(status, obj))
+    if obj.get("remember"):
+        save_cached_write_key(server_id, obj["key"])
+    return obj["key"]
+
+
+def zotero_write_key(server_id):
+    return load_cached_write_key(server_id) or authorize_zotero_write(server_id)
+
+
+def _payload_identifier(item):
+    pmids = item_pmids(item)
+    if pmids:
+        return "PMID {}".format(sorted(pmids, key=int)[0])
+    dois = item_dois(item)
+    if dois:
+        return "DOI {}".format(sorted(dois)[0])
+    title = str(item.get("title") or "").strip()
+    return title[:80] if title else "reference"
+
+
+def _find_payload_in_zotero(item):
+    pmid_map, doi_map, title_map, _ = load_zotero_index()
+    for pmid in item_pmids(item):
+        if pmid in pmid_map:
+            return pmid_map[pmid]
+    for doi in item_dois(item):
+        doi = normalize_doi(doi)
+        if doi in doi_map:
+            return doi_map[doi]
+    title = str(item.get("title") or "")
+    if title:
+        return choose_title_match(title, title_map, year_from_data(item), first_author_from_data(item))
+    return None
+
+
+def post_zotero_items(items, collection_key=None, max_attempts=3, timeout=60):
+    """Create items one-by-one with retries and verification after ambiguous failures."""
+    if not items:
+        return 0, []
+    server_id = zotero_server_id()
+    if not server_id:
+        raise RuntimeError("This Zotero version does not support local API writes.")
+
+    created = 0
+    failures = []
+    key = zotero_write_key(server_id)
+
+    for original in items:
+        item = dict(original)
+        if collection_key:
+            cols = list(item.get("collections") or [])
+            if collection_key not in cols:
+                cols.append(collection_key)
+            item["collections"] = cols
+
+        label = _payload_identifier(item)
+        token = uuid.uuid4().hex
+        done = False
+
+        for attempt in range(1, max_attempts + 1):
+            write_event("Zotero write {}/{} for {} (timeout {}s)...".format(attempt, max_attempts, label, timeout))
+            try:
+                obj, response_headers, status, elapsed = zotero_raw_request(
+                    "POST",
+                    "/users/0/items",
+                    payload=[item],
+                    api_key=key,
+                    server_id=server_id,
+                    extra_headers={"Zotero-Write-Token": token},
+                    timeout=timeout,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                write_event("{}".format(message))
+                if "TIMEOUT" in message:
+                    write_event("The request outcome is ambiguous, so checking Zotero before retrying...")
+                    try:
+                        found = _find_payload_in_zotero(item)
+                    except Exception as verify_exc:
+                        found = None
+                        write_event("Verification check also failed: {}".format(verify_exc))
+                    if found:
+                        write_event("{} is present in Zotero; treating the timed-out write as successful.".format(label))
