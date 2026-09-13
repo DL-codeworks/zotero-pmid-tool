@@ -1,0 +1,31 @@
+name: Assemble source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".bootstrap/READY"
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble source files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path('.bootstrap')
+          Path('gui.py').write_text(''.join(p.read_text() for p in sorted(root.glob('gui.part*'))))
+          Path('pmid_docx_to_zotero.py').write_text(''.join(p.read_text() for p in sorted(root.glob('core.part*'))))
+          PY
+      - name: Commit source files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gui.py pmid_docx_to_zotero.py
+          git commit -m "Add Zotero PMID Tool source"
+          git push
