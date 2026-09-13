@@ -1,0 +1,286 @@
+        return None
+    return ZoteroRef(
+        key,
+        item_label(data),
+        str(data.get("title") or ""),
+        zotero_item_uri(item, key),
+        data=data,
+        item=item,
+    )
+
+
+def load_zotero_index():
+    pmid_map = {}
+    doi_map = {}
+    title_map = {}
+    refs = []
+    for item in load_all_zotero_items():
+        ref = build_ref(item)
+        if ref is None:
+            continue
+        refs.append(ref)
+        for pmid in item_pmids(ref.data):
+            pmid_map.setdefault(pmid, ref)
+        for doi in item_dois(ref.data):
+            doi_map.setdefault(doi, ref)
+        nt = normalize_title(ref.title)
+        if nt:
+            title_map.setdefault(nt, []).append(ref)
+    return pmid_map, doi_map, title_map, refs
+
+
+def article_title(article):
+    med = article.find("MedlineCitation") if article is not None else None
+    art = med.find("Article") if med is not None else None
+    return clean_ris_text(node_text(art.find("ArticleTitle"))) if art is not None else ""
+
+
+def article_year(article):
+    med = article.find("MedlineCitation") if article is not None else None
+    art = med.find("Article") if med is not None else None
+    if art is None:
+        return ""
+    journal = art.find("Journal")
+    issue = journal.find("JournalIssue") if journal is not None else None
+    pd = issue.find("PubDate") if issue is not None else None
+    if pd is None:
+        return ""
+    year = node_text(pd.find("Year"))
+    if year:
+        return year
+    m = re.search(r"\b(?:18|19|20)\d{2}\b", node_text(pd.find("MedlineDate")))
+    return m.group(0) if m else ""
+
+
+def article_first_author(article):
+    med = article.find("MedlineCitation") if article is not None else None
+    art = med.find("Article") if med is not None else None
+    if art is None:
+        return ""
+    au = art.find("AuthorList/Author")
+    if au is None:
+        return ""
+    return (node_text(au.find("LastName")) or node_text(au.find("CollectiveName"))).strip().casefold()
+
+
+def choose_title_match(title, title_map, expected_year="", expected_author=""):
+    nt = normalize_title(title)
+    if not nt:
+        return None
+    exact = title_map.get(nt) or []
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        filtered = exact
+        if expected_year:
+            y = [r for r in filtered if year_from_data(r.data) == expected_year]
+            if y:
+                filtered = y
+        if expected_author:
+            a = [r for r in filtered if first_author_from_data(r.data) == expected_author.casefold()]
+            if a:
+                filtered = a
+        if len(filtered) == 1:
+            return filtered[0]
+        return None
+
+    # Fuzzy title matching is deliberately conservative and requires supporting
+    # author or year agreement to avoid merging distinct publications.
+    best = None
+    best_score = 0.0
+    for candidate_title, candidate_refs in title_map.items():
+        score = difflib.SequenceMatcher(None, nt, candidate_title).ratio()
+        if score < 0.97 or score <= best_score:
+            continue
+        for ref in candidate_refs:
+            year_ok = bool(expected_year and year_from_data(ref.data) == expected_year)
+            author_ok = bool(expected_author and first_author_from_data(ref.data) == expected_author.casefold())
+            if year_ok or author_ok:
+                best = ref
+                best_score = score
+    return best
+
+
+def identifiers_in_text(text):
+    found = []
+    mask = list(text)
+    for m in DOI_RE.finditer(text):
+        raw_doi = m.group(1)
+        trimmed = _trim_doi_value(raw_doi)
+        doi = normalize_doi(trimmed)
+        if doi:
+            # Include an optional doi:/https://doi.org prefix, but do not swallow
+            # ordinary sentence punctuation or an outer citation parenthesis.
+            effective_end = m.start(1) + len(trimmed)
+            found.append((m.start(), effective_end, "doi", doi))
+            for i in range(m.start(), effective_end):
+                mask[i] = " "
+    masked = "".join(mask)
+    for m in PMID_RE.finditer(masked):
+        found.append((m.start(), m.end(), "pmid", m.group(1)))
+    return sorted(found, key=lambda x: x[0])
+
+
+def balanced_outer_spans(text):
+    stack = []
+    spans = []
+    pairs = {")": "(", "]": "["}
+    for i, ch in enumerate(text):
+        if ch in "([":
+            stack.append((ch, i))
+        elif ch in ")]":
+            if stack and stack[-1][0] == pairs[ch]:
+                _, start = stack.pop()
+                if not stack:
+                    spans.append((start, i + 1))
+    return spans
+
+
+def strip_identifiers(text):
+    text = DOI_RE.sub(" ", text)
+    text = re.sub(r"\b(?:PMID|PubMed(?:\s+ID)?)\s*:\s*", " ", text, flags=re.I)
+    text = PMID_RE.sub(" ", text)
+    return re.sub(r"[\s,;]+", "", text)
+
+
+def generate_citation_id():
+    chars = string.ascii_letters + string.digits
+    return "".join(random.choice(chars) for _ in range(8))
+
+
+def provisional_citation(refs):
+    labels = []
+    seen = set()
+    for ref in refs:
+        if ref.key not in seen:
+            seen.add(ref.key)
+            m = re.match(r"^(.*?) \(([^()]*)\)$", ref.label)
+            labels.append("{} {}".format(m.group(1), m.group(2)) if m else ref.label)
+    return "(" + "; ".join(labels) + ")"
+
+
+def build_citation_data(refs):
+    citation_items = []
+    seen = set()
+    for ref in refs:
+        if ref.key in seen:
+            continue
+        seen.add(ref.key)
+        citation_items.append({"uris": [ref.uri]})
+    display = provisional_citation(refs)
+    return {
+        "citationID": generate_citation_id(),
+        "properties": {
+            "formattedCitation": display,
+            "plainCitation": display,
+        },
+        "citationItems": citation_items,
+        "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+    }, display
+
+
+def escape_xml_text(value):
+    return xml_escape(value, {'"': '&quot;', "'": '&apos;'})
+
+
+def build_word_field_xml(refs):
+    citation_data, display = build_citation_data(refs)
+    json_text = json.dumps(citation_data, ensure_ascii=False, separators=(",", ":"))
+    escaped_json = escape_xml_text(json_text)
+    escaped_display = escape_xml_text(display)
+    return (
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {} </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>{}</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+    ).format(escaped_json, escaped_display)
+
+
+def build_inline_field_insertion(refs):
+    # This intentionally mirrors the current ODF/DOCX Scan implementation:
+    # close the current Word text run, insert a complete Word field, then reopen
+    # a text run for whatever ordinary text follows.
+    return '</w:t></w:r>' + build_word_field_xml(refs) + '<w:r><w:t xml:space="preserve">'
+
+
+def find_replacements(text, pmid_map, doi_map):
+    replacements = []
+    missing_pmids = set()
+    missing_dois = set()
+    manual = []
+    protected = []
+
+    def ref_for(kind, value):
+        return pmid_map.get(value) if kind == "pmid" else doi_map.get(normalize_doi(value))
+
+    def overlaps(s, e):
+        return any(s < r.end and e > r.start for r in replacements)
+
+    # Parenthetical/bracketed groups first. PMID-only, DOI-only, and mixed
+    # groups all become one Zotero citation field containing multiple items.
+    for start, end in balanced_outer_spans(text):
+        chunk = text[start:end]
+        ids = identifiers_in_text(chunk)
+        if not ids:
+            continue
+        refs = []
+        missing = []
+        for _, _, kind, value in ids:
+            ref = ref_for(kind, value)
+            if ref:
+                refs.append(ref)
+            else:
+                missing.append((kind, value))
+        if missing:
+            for kind, value in missing:
+                (missing_pmids if kind == "pmid" else missing_dois).add(value)
+            protected.append((start, end))
+            continue
+
+        residual = strip_identifiers(chunk[1:-1])
+        normalized = re.sub(r"[^a-z]", "", residual.lower())
+        if not residual:
+            replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids]))
+        elif normalized == "addmore":
+            replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids], " [add more]"))
+        else:
+            protected.append((start, end))
+            manual.append(chunk)
+
+    def inside_protected(pos):
+        return any(s <= pos < e for s, e in protected)
+
+    # Explicit PMID clusters outside parentheses.
+    cluster_re = re.compile(r"\bPMID\s*:\s*(?P<body>\d{6,8}(?:\s*(?:[,;]\s*|\s+)\d{6,8})*)", re.I)
+    for m in cluster_re.finditer(text):
+        if overlaps(m.start(), m.end()) or inside_protected(m.start()):
+            continue
+        pmids = PMID_RE.findall(m.group("body"))
+        refs = [pmid_map.get(p) for p in pmids]
+        if any(r is None for r in refs):
+            missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
+            continue
+        replacements.append(Replacement(m.start(), m.end(), refs, pmids))
+
+    # Remaining standalone PMIDs and DOI strings.
+    for start, end, kind, value in identifiers_in_text(text):
+        if overlaps(start, end) or inside_protected(start):
+            continue
+        ref = ref_for(kind, value)
+        if ref:
+            replacements.append(Replacement(start, end, [ref], [value]))
+        else:
+            (missing_pmids if kind == "pmid" else missing_dois).add(value)
+
+    replacements.sort(key=lambda r: r.start)
+    return replacements, missing_pmids, missing_dois, manual
+
+
+def patch_paragraph(paragraph_xml, replacements):
+    matches = list(WT_RE.finditer(paragraph_xml))
+    if not matches or not replacements:
+        return paragraph_xml
+    texts = [html.unescape(m.group(2)) for m in matches]
+    intervals = []
+    cursor = 0
