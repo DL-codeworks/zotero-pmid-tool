@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Modern dark GUI frontend for pmid_docx_to_zotero.py.
+
+The Zotero/DOCX conversion logic remains in pmid_docx_to_zotero.py. This GUI
+runs that exact engine in a worker thread, redirects its console output into the
+window, and turns blocking input() prompts into visible dark modal dialogs.
+
+No third-party GUI dependency is required; this stays compatible with the
+single-file PyInstaller build.
+"""
+
+import builtins
+import contextlib
+import json
+import os
+import queue
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import filedialog
+import tkinter.font as tkfont
+
+import pmid_docx_to_zotero as core
+
+APP_TITLE = "Zotero PMID Tool"
+APP_VERSION = "1.5"
+REQUIREMENTS_NOTICE_VERSION = 2
+
+# Dark palette
+BG = "#111318"
+PANEL = "#1a1d24"
+PANEL_ALT = "#161920"
+FIELD = "#0f1116"
+BORDER = "#343945"
+BORDER_FOCUS = "#5b8cff"
+FG = "#f4f6f8"
+MUTED = "#a7afba"
+SUBTLE = "#7d8590"
+ACCENT = "#5b8cff"
+ACCENT_HOVER = "#6c98ff"
+ACCENT_PRESS = "#4a79e2"
+SUCCESS = "#57c78a"
+DANGER = "#ef6b73"
+WARNING = "#e0ad56"
+DISABLED = "#2a2e37"
+
+
+def gui_settings_path():
+    return core.app_data_dir() / "gui_settings.json"
+
+
+def load_gui_settings():
+    try:
+        return json.loads(gui_settings_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_gui_settings(settings):
+    try:
+        path = gui_settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def rounded_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
+    """Reliable rounded rectangle using arcs + rectangles, not a smoothed polygon."""
+    radius = max(1, int(radius))
+    radius = min(radius, max(1, int((x2 - x1) / 2)), max(1, int((y2 - y1) / 2)))
+    diameter = radius * 2
+    tags = kwargs.pop("tags", None)
+    ids = []
+    ids.append(canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, tags=tags, **kwargs))
+    ids.append(canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, tags=tags, **kwargs))
+    ids.append(canvas.create_arc(x1, y1, x1 + diameter, y1 + diameter,
+                                 start=90, extent=90, style="pieslice", tags=tags, **kwargs))
+    ids.append(canvas.create_arc(x2 - diameter, y1, x2, y1 + diameter,
+                                 start=0, extent=90, style="pieslice", tags=tags, **kwargs))
+    ids.append(canvas.create_arc(x1, y2 - diameter, x1 + diameter, y2,
+                                 start=180, extent=90, style="pieslice", tags=tags, **kwargs))
+    ids.append(canvas.create_arc(x2 - diameter, y2 - diameter, x2, y2,
+                                 start=270, extent=90, style="pieslice", tags=tags, **kwargs))
+    return ids
+
+
+class RoundedPanel(tk.Frame):
+    """Frame whose geometry is driven by normal Tk layout, with a rounded canvas behind it."""
+
+    def __init__(self, master, bg_color=PANEL, border_color=BORDER, radius=8,
+                 padding=14, title=None, **kwargs):
+        tk.Frame.__init__(self, master, bg=BG, bd=0, highlightthickness=0, **kwargs)
+        self.bg_color = bg_color
+        self.border_color = border_color
+        self.radius = radius
+        self.padding = padding
+        self.canvas = tk.Canvas(self, bg=BG, bd=0, highlightthickness=0)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        pad_frame = tk.Frame(self, bg=bg_color, bd=0, highlightthickness=0)
+        pad_frame.pack(fill="both", expand=True, padx=padding, pady=padding)
+        if title:
+            tk.Label(pad_frame, text=title, bg=bg_color, fg=FG,
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 9))
+            self.inner = tk.Frame(pad_frame, bg=bg_color, bd=0, highlightthickness=0)
+            self.inner.pack(fill="both", expand=True)
+        else:
+            self.inner = pad_frame
+        self.bind("<Configure>", self._redraw)
+
+    def _redraw(self, _event=None):
+        w = max(2, self.winfo_width())
+        h = max(2, self.winfo_height())
+        self.canvas.delete("panel")
+        # border
+        rounded_rect(self.canvas, 0, 0, w - 1, h - 1, self.radius,
+                     fill=self.border_color, outline=self.border_color, tags="panel")
+        # inner fill, 1px inset
+        rounded_rect(self.canvas, 1, 1, w - 2, h - 2, max(2, self.radius - 1),
+                     fill=self.bg_color, outline=self.bg_color, tags="panel")
+        self.canvas.tag_lower("panel")
+
+
+class RoundedButton(tk.Canvas):
+    def __init__(self, master, text, command=None, accent=False, width=None, height=34,
+                 radius=6, font=None, **kwargs):
+        self._font = font or tkfont.Font(family="Segoe UI", size=9, weight="bold" if accent else "normal")
+        if width is None:
+            width = max(74, self._font.measure(text) + 26)
+        tk.Canvas.__init__(self, master, width=width, height=height, bg=master.cget("bg"),
+                           bd=0, highlightthickness=0, cursor="hand2", **kwargs)
+        self.text = text
+        self.command = command
+        self.accent = accent
+        self.radius = radius
+        self._state = "normal"
+        self._hover = False
+        self._pressed = False
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            self.configure_cursor()
+            self._draw()
+        if "text" in kwargs:
+            self.text = kwargs.pop("text")
+            self._draw()
+        if kwargs:
+            return tk.Canvas.configure(self, **kwargs)
+        return None
+
+    config = configure
+
+    def cget(self, key):
+        if key == "state":
+            return self._state
+        return tk.Canvas.cget(self, key)
+
+    def configure_cursor(self):
+        tk.Canvas.configure(self, cursor="hand2" if self._state != "disabled" else "arrow")
+
+    def _colors(self):
+        if self._state == "disabled":
+            return DISABLED, "#777f89", DISABLED
+        if self.accent:
+            fill = ACCENT_PRESS if self._pressed else (ACCENT_HOVER if self._hover else ACCENT)
+            return fill, "#ffffff", fill
+        fill = "#313640" if self._pressed else ("#373d48" if self._hover else "#292e37")
+        return fill, FG, BORDER
+
+    def _draw(self):
+        self.delete("all")
+        w = max(2, int(float(tk.Canvas.cget(self, "width"))))
+        h = max(2, int(float(tk.Canvas.cget(self, "height"))))
+        fill, fg, border = self._colors()
+        rounded_rect(self, 0, 0, w - 1, h - 1, self.radius,
+                     fill=border, outline=border)
+        rounded_rect(self, 1, 1, w - 2, h - 2, max(2, self.radius - 1),
+                     fill=fill, outline=fill)
+        self.create_text(w / 2, h / 2, text=self.text, fill=fg, font=self._font)
+
+    def _on_enter(self, _event):
+        if self._state != "disabled":
+            self._hover = True
+            self._draw()
+
+    def _on_leave(self, _event):
+        self._hover = False
+        self._pressed = False
+        self._draw()
+
+    def _on_press(self, _event):
+        if self._state != "disabled":
+            self._pressed = True
+            self._draw()
+
+    def _on_release(self, event):
+        if self._state == "disabled":
+            return
+        was_pressed = self._pressed
+        self._pressed = False
+        self._draw()
+        if was_pressed and 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height():
+            if self.command:
+                self.command()
+
+
+class RoundedEntry(tk.Canvas):
+    def __init__(self, master, textvariable=None, height=36, radius=6, **kwargs):
+        tk.Canvas.__init__(self, master, height=height, bg=master.cget("bg"), bd=0,
+                           highlightthickness=0, **kwargs)
+        self.radius = radius
+        self.height_px = height
+        self._state = "normal"
+        self._focus = False
+        self.entry = tk.Entry(
+            self, textvariable=textvariable, bg=FIELD, fg=FG, insertbackground=FG,
+            disabledbackground="#20242b", disabledforeground=SUBTLE,
+            relief="flat", bd=0, highlightthickness=0,
+            font=("Segoe UI", 9)
+        )
+        self.window_id = self.create_window(12, height / 2, window=self.entry, anchor="w")
+        self.bind("<Configure>", self._redraw)
+        self.entry.bind("<FocusIn>", self._focus_in)
+        self.entry.bind("<FocusOut>", self._focus_out)
+        self.bind("<Button-1>", lambda _e: self.entry.focus_set())
+        self._redraw()
+
+    def _focus_in(self, _event=None):
+        self._focus = True
+        self._redraw()
+
+    def _focus_out(self, _event=None):
+        self._focus = False
+        self._redraw()
+
+    def _redraw(self, _event=None):
+        self.delete("field")
+        w = max(60, self.winfo_width())
+        h = self.height_px
+        border = BORDER_FOCUS if self._focus and self._state != "disabled" else BORDER
+        fill = "#20242b" if self._state == "disabled" else FIELD
+        rounded_rect(self, 0, 0, w - 1, h - 1, self.radius,
+                     fill=border, outline=border, tags="field")
+        rounded_rect(self, 1, 1, w - 2, h - 2, max(2, self.radius - 1),
+                     fill=fill, outline=fill, tags="field")
+        self.tag_lower("field")
+        self.itemconfigure(self.window_id, width=max(20, w - 24))
+        self.entry.configure(bg=fill)
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            self.entry.configure(state=self._state)
+            self._redraw()
+        if kwargs:
