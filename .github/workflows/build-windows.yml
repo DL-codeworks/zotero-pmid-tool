@@ -84,6 +84,60 @@ jobs:
               assert not mp and not md and not manual
           '@ | python -
 
+      - name: Bibliography exclusion regression check
+        shell: pwsh
+        run: |
+          @'
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          import pmid_docx_to_zotero as m
+
+          body_ref = m.ZoteroRef('BODY0001', 'Body (2020)', 'Body', 'http://zotero.org/users/1/items/BODY0001')
+          bib_ref = m.ZoteroRef('BIB00002', 'Bib (2021)', 'Bib', 'http://zotero.org/users/1/items/BIB00002')
+          pmids = {'23731077': body_ref, '12402102': bib_ref}
+
+          zotero_bib = (
+              '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+              '<w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_BIBL {"uncited":[],"omitted":[],"custom":[]} CSL_BIBLIOGRAPHY </w:instrText></w:r>'
+              '<w:r><w:fldChar w:fldCharType="separate"/></w:r></w:p>'
+              '<w:p><w:pPr><w:pStyle w:val="Bibliography"/></w:pPr><w:r><w:t>Smith PMID: 12402102</w:t></w:r></w:p>'
+              '<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+          )
+          doc = '<w:document><w:body><w:p><w:r><w:t>Body (23731077)</w:t></w:r></w:p>' + zotero_bib + '</w:body></w:document>'
+          assert m._zotero_bibliography_field_spans(doc)
+          out, stats = m.patch_document_xml(doc, pmids, {})
+          assert stats['ids'] == ['23731077'], stats
+          assert out.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 1
+          assert 'PMID: 12402102' in out
+
+          manual = (
+              '<w:document><w:body>'
+              '<w:p><w:r><w:t>Body 23731077</w:t></w:r></w:p>'
+              '<w:p><w:r><w:t>References</w:t></w:r></w:p>'
+              '<w:p><w:r><w:t>Smith et al. PMID: 12402102</w:t></w:r></w:p>'
+              '</w:body></w:document>'
+          )
+          out2, stats2 = m.patch_document_xml(manual, pmids, {})
+          assert stats2['ids'] == ['23731077'], stats2
+          assert out2.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 1
+          assert 'PMID: 12402102' in out2
+
+          with tempfile.TemporaryDirectory() as td:
+              p = Path(td) / 'test.docx'
+              comments = '<w:comments><w:comment w:id="1"><w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p></w:comment></w:comments>'
+              doc_with_comment = manual.replace(
+                  '<w:p><w:r><w:t>Smith et al. PMID: 12402102</w:t></w:r></w:p>',
+                  '<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>Smith et al. PMID: 12402102</w:t></w:r><w:commentRangeEnd w:id="1"/></w:p>'
+              )
+              with zipfile.ZipFile(p, 'w') as z:
+                  z.writestr('word/document.xml', doc_with_comment)
+                  z.writestr('word/comments.xml', comments)
+              found_pmids, found_dois = m.all_identifiers_in_docx(p)
+              assert found_pmids == {'23731077'}, found_pmids
+              assert not found_dois
+          '@ | python -
+
       - name: Install PyInstaller
         run: python -m pip install --upgrade pyinstaller
 
