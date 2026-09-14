@@ -1,0 +1,288 @@
+name: Fix bibliography scanning
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fix-bibliography-scan.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply bibliography exclusion fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          path = Path('pmid_docx_to_zotero.py')
+          text = path.read_text(encoding='utf-8')
+
+          marker = '\ndef patch_document_xml(xml, pmid_map, doi_map):\n'
+          if marker not in text:
+              raise SystemExit('patch_document_xml marker not found')
+
+          helpers = r'''
+          _BIBLIOGRAPHY_HEADINGS = {
+              "references",
+              "bibliography",
+              "works cited",
+              "literature cited",
+              "references cited",
+              "reference list",
+          }
+          _FIELD_CHAR_TOKEN_RE = re.compile(
+              r'<w:fldChar\b[^>]*\bw:fldCharType="(?P<kind>begin|end)"[^>]*/?>',
+              re.I,
+          )
+          _INSTR_TEXT_RE = re.compile(
+              r'<w:instrText\b[^>]*>(?P<code>[\s\S]*?)</w:instrText>',
+              re.I,
+          )
+
+
+          def _field_span_containing_instruction(document_xml, instr_start, instr_end):
+              """Return the full complex Word field containing one instrText node."""
+              stack = []
+              for token in _FIELD_CHAR_TOKEN_RE.finditer(document_xml, 0, instr_start):
+                  if token.group("kind").lower() == "begin":
+                      stack.append(token.start())
+                  elif stack:
+                      stack.pop()
+              if not stack:
+                  return None
+
+              field_start = stack[-1]
+              depth = 1
+              for token in _FIELD_CHAR_TOKEN_RE.finditer(document_xml, instr_end):
+                  if token.group("kind").lower() == "begin":
+                      depth += 1
+                  else:
+                      depth -= 1
+                      if depth == 0:
+                          return field_start, token.end()
+              return None
+
+
+          def _zotero_bibliography_field_spans(document_xml):
+              """Locate Zotero bibliography fields by their official Word field code."""
+              spans = []
+              for instr in _INSTR_TEXT_RE.finditer(document_xml):
+                  code = html.unescape(instr.group("code"))
+                  if "ADDIN ZOTERO_BIBL" not in code or "CSL_BIBLIOGRAPHY" not in code:
+                      continue
+                  span = _field_span_containing_instruction(document_xml, instr.start(), instr.end())
+                  if span and span not in spans:
+                      spans.append(span)
+              return spans
+
+
+          def _paragraph_style_value(paragraph_xml):
+              m = re.search(r'<w:pStyle\b[^>]*\bw:val="([^"]+)"[^>]*/?>', paragraph_xml, re.I)
+              return html.unescape(m.group(1)).strip() if m else ""
+
+
+          def _merge_spans(spans):
+              if not spans:
+                  return []
+              ordered = sorted(spans)
+              merged = [list(ordered[0])]
+              for start, end in ordered[1:]:
+                  if start <= merged[-1][1]:
+                      merged[-1][1] = max(merged[-1][1], end)
+                  else:
+                      merged.append([start, end])
+              return [tuple(x) for x in merged]
+
+
+          def _bibliography_exclusion_spans(document_xml):
+              """Return XML ranges that must never be treated as citation placeholders."""
+              field_spans = _zotero_bibliography_field_spans(document_xml)
+              paragraphs = list(PARA_RE.finditer(document_xml))
+              style_spans = []
+              for pm in paragraphs:
+                  if _paragraph_style_value(pm.group(0)).casefold() == "bibliography":
+                      style_spans.append((pm.start(), pm.end()))
+
+              spans = list(field_spans) + style_spans
+
+              # A plain-text reference list has no Zotero field to identify. In that
+              # case, use the last conventional standalone bibliography heading and
+              # ignore the remainder of the document. Choosing the last match avoids
+              # a same-named entry in a table of contents.
+              if not field_spans and not style_spans:
+                  heading_start = None
+                  for pm in paragraphs:
+                      heading = re.sub(r"\s+", " ", visible_text(pm.group(0))).strip()
+                      heading = heading.rstrip(":").strip().casefold()
+                      if heading in _BIBLIOGRAPHY_HEADINGS:
+                          heading_start = pm.start()
+                  if heading_start is not None:
+                      spans.append((heading_start, len(document_xml)))
+
+              return _merge_spans(spans)
+
+
+          def _range_overlaps_spans(start, end, spans):
+              return any(start < span_end and end > span_start for span_start, span_end in spans)
+
+
+          def _bibliography_comment_ids(document_xml, spans=None):
+              spans = _bibliography_exclusion_spans(document_xml) if spans is None else spans
+              if not spans:
+                  return set()
+              out = set()
+              pattern = re.compile(r'<w:commentRangeStart\b[^>]*\bw:id="(\d+)"[^>]*/>', re.I)
+              for m in pattern.finditer(document_xml):
+                  if _range_overlaps_spans(m.start(), m.end(), spans):
+                      out.add(int(m.group(1)))
+              return out
+          '''
+          helpers = textwrap.dedent(helpers).strip('\n') + '\n\n'
+          text = text.replace(marker, '\n' + helpers + 'def patch_document_xml(xml, pmid_map, doi_map):\n', 1)
+
+          old = '    stats = {"locations": 0, "ids": [], "missing_pmids": set(), "missing_dois": set(), "manual": []}\n    for pm in PARA_RE.finditer(xml):\n'
+          new = '    stats = {"locations": 0, "ids": [], "missing_pmids": set(), "missing_dois": set(), "manual": []}\n    bibliography_spans = _bibliography_exclusion_spans(xml)\n    for pm in PARA_RE.finditer(xml):\n'
+          if old not in text:
+              raise SystemExit('patch_document_xml stats block not found')
+          text = text.replace(old, new, 1)
+
+          old = '        if "ADDIN ZOTERO_ITEM CSL_CITATION" not in para:\n'
+          new = '        if (not _range_overlaps_spans(pm.start(), pm.end(), bibliography_spans)\n                and "ADDIN ZOTERO_ITEM CSL_CITATION" not in para):\n'
+          if old not in text:
+              raise SystemExit('patch_document_xml condition not found')
+          text = text.replace(old, new, 1)
+
+          old = '    document_xml = parts["word/document.xml"]\n\n    records = comment_records(comments, comments_ex)\n'
+          new = '    document_xml = parts["word/document.xml"]\n    bibliography_comment_ids = _bibliography_comment_ids(document_xml)\n\n    records = comment_records(comments, comments_ex)\n'
+          if old not in text:
+              raise SystemExit('comment document block not found')
+          text = text.replace(old, new, 1)
+
+          old = '    for rec in records:\n        if rec["is_reply"]:\n            continue\n'
+          new = '    for rec in records:\n        if rec["is_reply"] or rec["id"] in bibliography_comment_ids:\n            continue\n'
+          if old not in text:
+              raise SystemExit('comment loop block not found')
+          text = text.replace(old, new, 1)
+
+          old = '''        if "word/document.xml" in z.namelist():
+              xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+              # A DOI may legally contain parentheses and punctuation. Never concatenate
+              # adjacent Word paragraphs before applying the DOI regex or text from the
+              # next paragraph can accidentally become part of the DOI.
+              for pm in PARA_RE.finditer(xml):
+                  collect_from_text(visible_text(pm.group(0)))
+
+          if "word/comments.xml" in z.namelist():
+              comments_xml = z.read("word/comments.xml").decode("utf-8", errors="replace")
+              # Keep comments independent for the same reason.
+              for cm in COMMENT_RE.finditer(comments_xml):
+                  collect_from_text(comment_visible_text(cm.group("body")))
+          '''
+          new = '''        bibliography_comment_ids = set()
+          if "word/document.xml" in z.namelist():
+              xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+              bibliography_spans = _bibliography_exclusion_spans(xml)
+              bibliography_comment_ids = _bibliography_comment_ids(xml, bibliography_spans)
+              # A DOI may legally contain parentheses and punctuation. Never concatenate
+              # adjacent Word paragraphs before applying the DOI regex or text from the
+              # next paragraph can accidentally become part of the DOI.
+              for pm in PARA_RE.finditer(xml):
+                  if _range_overlaps_spans(pm.start(), pm.end(), bibliography_spans):
+                      continue
+                  collect_from_text(visible_text(pm.group(0)))
+
+          if "word/comments.xml" in z.namelist():
+              comments_xml = z.read("word/comments.xml").decode("utf-8", errors="replace")
+              # Keep comments independent for the same reason, and ignore comments
+              # attached to bibliography text.
+              for cm in COMMENT_RE.finditer(comments_xml):
+                  if int(cm.group("id")) in bibliography_comment_ids:
+                      continue
+                  collect_from_text(comment_visible_text(cm.group("body")))
+          '''
+          if old not in text:
+              raise SystemExit('all_identifiers_in_docx block not found')
+          text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Verify bibliography exclusions
+        shell: bash
+        run: |
+          python -m py_compile pmid_docx_to_zotero.py gui.py
+          python - <<'PY'
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          import pmid_docx_to_zotero as m
+
+          body_ref = m.ZoteroRef('BODY0001', 'Body (2020)', 'Body', 'http://zotero.org/users/1/items/BODY0001')
+          bib_ref = m.ZoteroRef('BIB00002', 'Bib (2021)', 'Bib', 'http://zotero.org/users/1/items/BIB00002')
+          pmids = {'23731077': body_ref, '12402102': bib_ref}
+
+          # Real Zotero bibliography field: field code is ADDIN ZOTERO_BIBL ... CSL_BIBLIOGRAPHY.
+          zotero_bib = (
+              '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+              '<w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_BIBL {"uncited":[],"omitted":[],"custom":[]} CSL_BIBLIOGRAPHY </w:instrText></w:r>'
+              '<w:r><w:fldChar w:fldCharType="separate"/></w:r></w:p>'
+              '<w:p><w:pPr><w:pStyle w:val="Bibliography"/></w:pPr><w:r><w:t>Smith PMID: 12402102</w:t></w:r></w:p>'
+              '<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+          )
+          doc = '<w:document><w:body><w:p><w:r><w:t>Body (23731077)</w:t></w:r></w:p>' + zotero_bib + '</w:body></w:document>'
+          spans = m._bibliography_exclusion_spans(doc)
+          assert spans, spans
+          out, stats = m.patch_document_xml(doc, pmids, {})
+          assert stats['ids'] == ['23731077'], stats
+          assert out.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 1
+          assert 'PMID: 12402102' in out
+
+          # Plain-text bibliography fallback: everything from the last conventional
+          # heading onward is excluded when no Zotero field/style exists.
+          manual = (
+              '<w:document><w:body>'
+              '<w:p><w:r><w:t>Body 23731077</w:t></w:r></w:p>'
+              '<w:p><w:r><w:t>References</w:t></w:r></w:p>'
+              '<w:p><w:r><w:t>Smith et al. PMID: 12402102</w:t></w:r></w:p>'
+              '</w:body></w:document>'
+          )
+          out2, stats2 = m.patch_document_xml(manual, pmids, {})
+          assert stats2['ids'] == ['23731077'], stats2
+          assert out2.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 1
+          assert 'PMID: 12402102' in out2
+
+          # Discovery/import pass must obey the same exclusions so bibliography
+          # identifiers are not imported into Zotero before conversion starts.
+          with tempfile.TemporaryDirectory() as td:
+              p = Path(td) / 'test.docx'
+              comments = '<w:comments><w:comment w:id="1"><w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p></w:comment></w:comments>'
+              doc_with_comment = manual.replace(
+                  '<w:p><w:r><w:t>Smith et al. PMID: 12402102</w:t></w:r></w:p>',
+                  '<w:p><w:commentRangeStart w:id="1"/><w:r><w:t>Smith et al. PMID: 12402102</w:t></w:r><w:commentRangeEnd w:id="1"/></w:p>'
+              )
+              with zipfile.ZipFile(p, 'w') as z:
+                  z.writestr('word/document.xml', doc_with_comment)
+                  z.writestr('word/comments.xml', comments)
+              found_pmids, found_dois = m.all_identifiers_in_docx(p)
+              assert found_pmids == {'23731077'}, found_pmids
+              assert not found_dois
+
+          print('bibliography exclusion tests passed')
+          PY
+
+      - name: Commit source fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pmid_docx_to_zotero.py
+          git commit -m "Exclude existing bibliographies from PMID and DOI scanning"
+          git push
