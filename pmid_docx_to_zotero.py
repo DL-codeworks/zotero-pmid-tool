@@ -1211,25 +1211,52 @@ def escape_xml_text(value):
     return xml_escape(value, {'"': '&quot;', "'": '&apos;'})
 
 
-def build_word_field_xml(refs):
+def _run_properties_for_text_match(xml, match):
+    """Return the direct Word run formatting that owns one <w:t> match."""
+    prefix = xml[:match.start()]
+    run_starts = list(re.finditer(r'<w:r\b[^>]*>', prefix))
+    if not run_starts:
+        return ""
+    run_start = run_starts[-1].start()
+    if prefix.rfind("</w:r>") > run_start:
+        return ""
+    run_prefix = xml[run_start:match.start()]
+    prop_match = re.search(
+        r'(<w:rPr\b[^>]*/>|<w:rPr\b[^>]*>[\s\S]*?</w:rPr>)',
+        run_prefix,
+    )
+    return prop_match.group(1) if prop_match else ""
+
+
+def _styled_word_run(inner_xml, run_properties=""):
+    return '<w:r>{}{}</w:r>'.format(run_properties or "", inner_xml)
+
+
+def build_word_field_xml(refs, run_properties=""):
     citation_data, display = build_citation_data(refs)
     json_text = json.dumps(citation_data, ensure_ascii=False, separators=(",", ":"))
     escaped_json = escape_xml_text(json_text)
     escaped_display = escape_xml_text(display)
     return (
-        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
-        '<w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {} </w:instrText></w:r>'
-        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
-        '<w:r><w:t>{}</w:t></w:r>'
-        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
-    ).format(escaped_json, escaped_display)
+        _styled_word_run('<w:fldChar w:fldCharType="begin"/>', run_properties)
+        + _styled_word_run(
+            '<w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {} </w:instrText>'.format(escaped_json),
+            run_properties,
+        )
+        + _styled_word_run('<w:fldChar w:fldCharType="separate"/>', run_properties)
+        + _styled_word_run('<w:t>{}</w:t>'.format(escaped_display), run_properties)
+        + _styled_word_run('<w:fldChar w:fldCharType="end"/>', run_properties)
+    )
 
 
-def build_inline_field_insertion(refs):
-    # This intentionally mirrors the current ODF/DOCX Scan implementation:
-    # close the current Word text run, insert a complete Word field, then reopen
-    # a text run for whatever ordinary text follows.
-    return '</w:t></w:r>' + build_word_field_xml(refs) + '<w:r><w:t xml:space="preserve">'
+def build_inline_field_insertion(refs, run_properties=""):
+    # Close the current Word text run, insert the Zotero field, then reopen
+    # ordinary text with the same formatting so insertion does not reset it.
+    return (
+        '</w:t></w:r>'
+        + build_word_field_xml(refs, run_properties)
+        + '<w:r>{}<w:t xml:space="preserve">'.format(run_properties or "")
+    )
 
 
 def find_replacements(text, pmid_map, doi_map):
@@ -1310,6 +1337,7 @@ def patch_paragraph(paragraph_xml, replacements):
     if not matches or not replacements:
         return paragraph_xml
     texts = [html.unescape(m.group(2)) for m in matches]
+    run_properties = [_run_properties_for_text_match(paragraph_xml, m) for m in matches]
     intervals = []
     cursor = 0
     for i, text in enumerate(texts):
@@ -1322,10 +1350,22 @@ def patch_paragraph(paragraph_xml, replacements):
         affected = [(i, s, e) for i, s, e in intervals if repl.start < e and repl.end > s]
         if not affected:
             continue
-        token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
-        token_fields[token] = build_inline_field_insertion(repl.refs)
         fi, fs, _ = affected[0]
         li, ls, _ = affected[-1]
+
+        # Prefer the text immediately before the citation. At the start of a
+        # paragraph, fall back to the run that contained the identifier itself.
+        style_index = fi
+        if repl.start > 0:
+            prior_pos = repl.start - 1
+            for idx, start, end in intervals:
+                if start <= prior_pos < end:
+                    style_index = idx
+                    break
+        style_xml = run_properties[style_index] if style_index < len(run_properties) else ""
+
+        token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
+        token_fields[token] = build_inline_field_insertion(repl.refs, style_xml)
         local_start = max(0, repl.start - fs)
         if fi == li:
             local_end = max(0, repl.end - fs)
@@ -1429,7 +1469,15 @@ def append_refs_at_comment_anchor(document_xml, comment_id, refs):
     if not refs_to_add:
         return document_xml, 0
 
-    payload = '<w:r><w:t xml:space="preserve"> </w:t></w:r>' + build_word_field_xml(refs_to_add)
+    preceding_text = list(WT_RE.finditer(document_xml, 0, em.start()))
+    run_properties = (
+        _run_properties_for_text_match(document_xml, preceding_text[-1])
+        if preceding_text else ""
+    )
+    payload = (
+        _styled_word_run('<w:t xml:space="preserve"> </w:t>', run_properties)
+        + build_word_field_xml(refs_to_add, run_properties)
+    )
     document_xml = document_xml[:em.start()] + payload + document_xml[em.start():]
     return document_xml, len(refs_to_add)
 

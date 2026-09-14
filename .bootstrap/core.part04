@@ -1,3 +1,109 @@
+failed"].append((ref.key, "collection membership could not be verified"))
+
+    print("Collection result for this document: {} already there, {} added, {} failed.".format(
+        stats["already"], stats["added"], len(stats["failed"])
+    ))
+    if stats["failed"]:
+        for key, reason in stats["failed"]:
+            print("  Could not add {}: {}".format(key, reason))
+    return stats
+
+
+def item_label(data):
+    creators = [c for c in (data.get("creators") or []) if c.get("creatorType") in ("author", "bookAuthor", "editor", "contributor")]
+    names = []
+    for c in creators:
+        name = (c.get("lastName") or c.get("name") or c.get("firstName") or "").strip()
+        if name:
+            names.append(name)
+    if not names:
+        author = "Unknown author"
+    elif len(names) == 1:
+        author = names[0]
+    elif len(names) == 2:
+        author = "{} and {}".format(names[0], names[1])
+    else:
+        author = "{} et al.".format(names[0])
+    m = re.search(r"\b(?:18|19|20)\d{2}\b", str(data.get("date") or ""))
+    year = m.group(0) if m else "n.d."
+    return "{} ({})".format(author, year)
+
+
+def item_pmids(data):
+    out = set()
+    for field in ("extra", "archiveLocation", "url"):
+        value = str(data.get(field) or "")
+        out.update(m.group(1) for m in PMID_LABELED_RE.finditer(value))
+        out.update(m.group(1) for m in PUBMED_URL_RE.finditer(value))
+    if "pubmed" in str(data.get("archive") or "").lower():
+        m = PMID_RE.search(str(data.get("archiveLocation") or ""))
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def item_dois(data):
+    out = set()
+    direct = str(data.get("DOI") or "").strip()
+    if direct:
+        out.add(normalize_doi(direct))
+    for field in ("extra", "url"):
+        value = str(data.get(field) or "")
+        out.update(normalize_doi(m.group(1)) for m in DOI_RE.finditer(value))
+    return set(d for d in out if d)
+
+
+def normalize_title(value):
+    value = html.unescape(value or "")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = "".join(ch if ch.isalnum() else " " for ch in value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def year_from_data(data):
+    m = re.search(r"\b(?:18|19|20)\d{2}\b", str(data.get("date") or ""))
+    return m.group(0) if m else ""
+
+
+def first_author_from_data(data):
+    for c in data.get("creators") or []:
+        if c.get("creatorType") == "author":
+            return (c.get("lastName") or c.get("name") or "").strip().casefold()
+    return ""
+
+
+def zotero_item_uri(item, key):
+    library = item.get("library") or {}
+    library_type = str(library.get("type") or "")
+    library_id = library.get("id")
+    if library_type == "user" and library_id not in (None, "", 0, "0"):
+        return "http://zotero.org/users/{}/items/{}".format(library_id, key)
+    if library_type == "group" and library_id not in (None, ""):
+        return "http://zotero.org/groups/{}/items/{}".format(library_id, key)
+
+    # Local API item links normally contain the real numeric user/group id.
+    links = item.get("links") or {}
+    for link_name in ("self", "alternate"):
+        link = links.get(link_name) or {}
+        href = str(link.get("href") or "")
+        m = re.search(r"/(users|groups)/(\d+)/items/([A-Z0-9]+)", href, re.I)
+        if m:
+            kind, lib_id, item_key = m.groups()
+            base = "users" if kind.lower() == "users" else "groups"
+            return "http://zotero.org/{}/{}/items/{}".format(base, lib_id, item_key)
+
+    # Current ODF/DOCX Scan accepts zotero://select as a fallback URI, but the
+    # numeric canonical URI above is preferred for a true Word citation field.
+    return "zotero://select/library/items/{}".format(key)
+
+
+def build_ref(item):
+    data = item.get("data") or {}
+    if data.get("itemType") in ("attachment", "note", "annotation"):
+        return None
+    key = data.get("key") or item.get("key")
+    if not key:
         return None
     return ZoteroRef(
         key,
@@ -151,136 +257,4 @@ def generate_citation_id():
 def provisional_citation(refs):
     labels = []
     seen = set()
-    for ref in refs:
-        if ref.key not in seen:
-            seen.add(ref.key)
-            m = re.match(r"^(.*?) \(([^()]*)\)$", ref.label)
-            labels.append("{} {}".format(m.group(1), m.group(2)) if m else ref.label)
-    return "(" + "; ".join(labels) + ")"
-
-
-def build_citation_data(refs):
-    citation_items = []
-    seen = set()
-    for ref in refs:
-        if ref.key in seen:
-            continue
-        seen.add(ref.key)
-        citation_items.append({"uris": [ref.uri]})
-    display = provisional_citation(refs)
-    return {
-        "citationID": generate_citation_id(),
-        "properties": {
-            "formattedCitation": display,
-            "plainCitation": display,
-        },
-        "citationItems": citation_items,
-        "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
-    }, display
-
-
-def escape_xml_text(value):
-    return xml_escape(value, {'"': '&quot;', "'": '&apos;'})
-
-
-def build_word_field_xml(refs):
-    citation_data, display = build_citation_data(refs)
-    json_text = json.dumps(citation_data, ensure_ascii=False, separators=(",", ":"))
-    escaped_json = escape_xml_text(json_text)
-    escaped_display = escape_xml_text(display)
-    return (
-        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
-        '<w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {} </w:instrText></w:r>'
-        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
-        '<w:r><w:t>{}</w:t></w:r>'
-        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
-    ).format(escaped_json, escaped_display)
-
-
-def build_inline_field_insertion(refs):
-    # This intentionally mirrors the current ODF/DOCX Scan implementation:
-    # close the current Word text run, insert a complete Word field, then reopen
-    # a text run for whatever ordinary text follows.
-    return '</w:t></w:r>' + build_word_field_xml(refs) + '<w:r><w:t xml:space="preserve">'
-
-
-def find_replacements(text, pmid_map, doi_map):
-    replacements = []
-    missing_pmids = set()
-    missing_dois = set()
-    manual = []
-    protected = []
-
-    def ref_for(kind, value):
-        return pmid_map.get(value) if kind == "pmid" else doi_map.get(normalize_doi(value))
-
-    def overlaps(s, e):
-        return any(s < r.end and e > r.start for r in replacements)
-
-    # Parenthetical/bracketed groups first. PMID-only, DOI-only, and mixed
-    # groups all become one Zotero citation field containing multiple items.
-    for start, end in balanced_outer_spans(text):
-        chunk = text[start:end]
-        ids = identifiers_in_text(chunk)
-        if not ids:
-            continue
-        refs = []
-        missing = []
-        for _, _, kind, value in ids:
-            ref = ref_for(kind, value)
-            if ref:
-                refs.append(ref)
-            else:
-                missing.append((kind, value))
-        if missing:
-            for kind, value in missing:
-                (missing_pmids if kind == "pmid" else missing_dois).add(value)
-            protected.append((start, end))
-            continue
-
-        residual = strip_identifiers(chunk[1:-1])
-        normalized = re.sub(r"[^a-z]", "", residual.lower())
-        if not residual:
-            replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids]))
-        elif normalized == "addmore":
-            replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids], " [add more]"))
-        else:
-            protected.append((start, end))
-            manual.append(chunk)
-
-    def inside_protected(pos):
-        return any(s <= pos < e for s, e in protected)
-
-    # Explicit PMID clusters outside parentheses.
-    cluster_re = re.compile(r"\bPMID\s*:\s*(?P<body>\d{6,8}(?:\s*(?:[,;]\s*|\s+)\d{6,8})*)", re.I)
-    for m in cluster_re.finditer(text):
-        if overlaps(m.start(), m.end()) or inside_protected(m.start()):
-            continue
-        pmids = PMID_RE.findall(m.group("body"))
-        refs = [pmid_map.get(p) for p in pmids]
-        if any(r is None for r in refs):
-            missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
-            continue
-        replacements.append(Replacement(m.start(), m.end(), refs, pmids))
-
-    # Remaining standalone PMIDs and DOI strings.
-    for start, end, kind, value in identifiers_in_text(text):
-        if overlaps(start, end) or inside_protected(start):
-            continue
-        ref = ref_for(kind, value)
-        if ref:
-            replacements.append(Replacement(start, end, [ref], [value]))
-        else:
-            (missing_pmids if kind == "pmid" else missing_dois).add(value)
-
-    replacements.sort(key=lambda r: r.start)
-    return replacements, missing_pmids, missing_dois, manual
-
-
-def patch_paragraph(paragraph_xml, replacements):
-    matches = list(WT_RE.finditer(paragraph_xml))
-    if not matches or not replacements:
-        return paragraph_xml
-    texts = [html.unescape(m.group(2)) for m in matches]
-    intervals = []
-    cursor = 0
+    for ref in r

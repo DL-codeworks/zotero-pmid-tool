@@ -1,149 +1,228 @@
-    doi_map = fresh_doi_map
+ item["publicationTitle"] = container
+        if short_container:
+            item["journalAbbreviation"] = short_container
+    elif item_type == "bookSection" and container:
+        item["bookTitle"] = container
+    elif item_type == "conferencePaper" and container:
+        item["proceedingsTitle"] = container
 
-    for pmid in all_pmids:
-        if pmid not in pmid_map and pubmed_articles.get(pmid) is not None:
-            article = pubmed_articles[pmid]
-            ref = choose_title_match(article_title(article), fresh_title_map, article_year(article), article_first_author(article))
-            if ref:
-                pmid_map[pmid] = ref
-    for doi in all_dois:
-        if doi not in doi_map:
-            meta = doi_metadata.get(doi) or {}
-            ref = choose_title_match(meta.get("title", ""), fresh_title_map, meta.get("year", ""), meta.get("author", ""))
-            if ref:
-                doi_map[doi] = ref
+    for key, zotero_key in (("volume", "volume"), ("issue", "issue"), ("page", "pages"), ("publisher", "publisher")):
+        value = clean_ris_text(str(message.get(key) or ""))
+        if value:
+            item[zotero_key] = value
 
+    date_value = ""
+    for date_key in ("published-print", "published-online", "published", "issued"):
+        date_obj = message.get(date_key) or {}
+        parts = date_obj.get("date-parts") if isinstance(date_obj, dict) else None
+        if parts and parts[0]:
+            vals = [str(x) for x in parts[0] if x is not None]
+            if vals:
+                date_value = "-".join(vals)
+                break
+    if date_value:
+        item["date"] = date_value
+
+    url = clean_ris_text(str(message.get("URL") or ""))
+    if url:
+        item["url"] = url
+    abstract = str(message.get("abstract") or "")
+    if abstract:
+        abstract = re.sub(r"<[^>]+>", " ", abstract)
+        abstract = clean_ris_text(abstract)
+        if abstract:
+            item["abstractNote"] = abstract
+
+    return item
+
+
+def fetch_pubmed_articles(pmids, batch_size=150):
+    """Fetch PubMed metadata once and return it keyed by PMID."""
+    ordered = sorted(set(pmids), key=int)
+    articles = {}
+    for i in range(0, len(ordered), batch_size):
+        batch = ordered[i:i + batch_size]
+        params = urllib.parse.urlencode({
+            "db": "pubmed",
+            "id": ",".join(batch),
+            "retmode": "xml",
+        })
+        req = urllib.request.Request(
+            "{}?{}".format(EUTILS_FETCH, params),
+            headers={"User-Agent": "PMID-DOCX-to-Zotero/3.0"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            root = ET.fromstring(response.read())
+        for article in root.findall("PubmedArticle"):
+            pmid = node_text(article.find("MedlineCitation/PMID"))
+            if pmid:
+                articles[pmid] = article
+        if i + batch_size < len(ordered):
+            time.sleep(0.35)
+    missing = [p for p in ordered if p not in articles]
+    return articles, missing
+
+
+def article_doi(article):
+    if article is None:
+        return ""
+    pub = article.find("PubmedData")
+    if pub is not None:
+        for aid in pub.findall("ArticleIdList/ArticleId"):
+            if (aid.attrib.get("IdType") or "").lower() == "doi":
+                return normalize_doi(node_text(aid))
+    return ""
+
+
+def fetch_pubmed_article_for_doi(doi):
+    """Resolve a DOI through PubMed first and verify the returned DOI."""
+    normalized = normalize_doi(doi)
+    params = urllib.parse.urlencode({
+        "db": "pubmed",
+        "term": "{}[AID]".format(normalized),
+        "retmode": "json",
+        "retmax": "10",
+    })
+    req = urllib.request.Request(
+        "{}?{}".format(EUTILS_SEARCH, params),
+        headers={"User-Agent": "PMID-DOCX-to-Zotero/4.0"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    ids = ((payload.get("esearchresult") or {}).get("idlist") or []) if isinstance(payload, dict) else []
+    if not ids:
+        return None
+    article_map, _ = fetch_pubmed_articles(ids)
+    for pmid in ids:
+        article = article_map.get(str(pmid))
+        if article is not None and article_doi(article) == normalized:
+            return article
+    return None
+
+
+def crossref_title_year_author(message):
+    titles = message.get("title") or []
+    title = clean_ris_text(titles[0] if titles else "")
+    year = ""
+    for date_key in ("published-print", "published-online", "published", "issued"):
+        date_obj = message.get(date_key) or {}
+        parts = date_obj.get("date-parts") if isinstance(date_obj, dict) else None
+        if parts and parts[0]:
+            year = str(parts[0][0]) if parts[0][0] is not None else ""
+            if year:
+                break
+    author = ""
+    authors = message.get("author") or []
+    if authors:
+        author = clean_ris_text(str(authors[0].get("family") or authors[0].get("name") or "")).casefold()
+    return title, year, author
+
+
+def report_document_match_status(all_pmids, all_dois, pmid_map, doi_map):
+    matched_pmids = len([p for p in all_pmids if p in pmid_map])
+    matched_dois = len([d for d in all_dois if d in doi_map])
+    print("Matched in Zotero for this document: {}/{} PMIDs; {}/{} DOIs.".format(
+        matched_pmids, len(all_pmids), matched_dois, len(all_dois)
+    ))
+
+
+def resolve_document_references(all_pmids, all_dois, pubmed_articles, requested_collection=None):
+    """Resolve only references in this DOCX and robustly import missing ones."""
+    pmid_map, doi_map, title_map, _ = load_zotero_index()
     report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
 
-    if collection_key:
-        document_refs = []
-        seen_keys = set()
-        for pmid in all_pmids:
-            ref = pmid_map.get(pmid)
-            if ref is not None and ref.key not in seen_keys:
-                seen_keys.add(ref.key)
-                document_refs.append(ref)
-        for doi in all_dois:
-            ref = doi_map.get(doi)
-            if ref is not None and ref.key not in seen_keys:
-                seen_keys.add(ref.key)
-                document_refs.append(ref)
-        try:
-            ensure_refs_in_collection(document_refs, collection_key, collection_path)
-        except Exception as exc:
-            write_event("Collection assignment warning: {}".format(exc))
+    # Collection choice applies to ALL resolved references used by this document,
+    # including items that were already in Zotero before this run.
+    collection_key, collection_path = (
+        resolve_requested_collection(requested_collection)
+        if requested_collection is not None
+        else choose_import_collection()
+    )
 
-    return pmid_map, doi_map, doi_metadata, no_pubmed, collection_path
-
-def write_pubmed_ris(path, pmids, article_map):
-    records = []
-    for pmid in sorted(set(pmids), key=int):
-        article = article_map.get(pmid)
-        if article is not None:
-            records.append(article_to_ris(article))
-    if not records:
-        return 0
-    path.write_text("\n\n".join(records) + "\n", encoding="utf-8")
-    return len(records)
-
-
-def refresh_document_maps(all_pmids, all_dois, pubmed_articles, doi_metadata):
-    pmid_map, doi_map, title_map, _ = load_zotero_index()
-    for pmid in all_pmids:
+    title_matches = []
+    for pmid in sorted(all_pmids, key=int):
         if pmid in pmid_map:
             continue
         article = pubmed_articles.get(pmid)
         if article is None:
             continue
-        ref = choose_title_match(article_title(article), title_map, article_year(article), article_first_author(article))
+        ref = choose_title_match(
+            article_title(article), title_map,
+            expected_year=article_year(article),
+            expected_author=article_first_author(article),
+        )
         if ref:
             pmid_map[pmid] = ref
-    for doi in all_dois:
+            doi = article_doi(article)
+            if doi:
+                doi_map.setdefault(doi, ref)
+            title_matches.append(("PMID {}".format(pmid), ref))
+
+    doi_metadata = {}
+    for doi in sorted(all_dois):
         if doi in doi_map:
             continue
-        meta = doi_metadata.get(doi) or {}
+        article = None
+        try:
+            article = fetch_pubmed_article_for_doi(doi)
+        except Exception as exc:
+            print("  PubMed DOI lookup warning for {}: {}".format(doi, exc))
+        if article is not None:
+            meta = {
+                "source": "pubmed", "article": article,
+                "title": article_title(article), "year": article_year(article),
+                "author": article_first_author(article),
+            }
+        else:
+            try:
+                message = fetch_crossref_message(doi)
+                title, year, author = crossref_title_year_author(message)
+                meta = {
+                    "source": "crossref", "message": message,
+                    "title": title, "year": year, "author": author,
+                }
+            except Exception as exc:
+                meta = {"source": "none", "error": str(exc), "title": "", "year": "", "author": ""}
+        doi_metadata[doi] = meta
         ref = choose_title_match(meta.get("title", ""), title_map, meta.get("year", ""), meta.get("author", ""))
         if ref:
             doi_map[doi] = ref
-    return pmid_map, doi_map
+            title_matches.append(("DOI {}".format(doi), ref))
 
+    if title_matches:
+        print("Matched {} document reference(s) to existing Zotero items by title.".format(len(title_matches)))
+        for identifier, ref in title_matches:
+            print("  {} -> {}".format(identifier, ref.label))
 
-def rewrite_docx(input_path, output_path, pmid_map, doi_map):
-    with zipfile.ZipFile(input_path, "r") as zin:
-        names = zin.namelist()
-        raw = {name: zin.read(name) for name in names}
-    parts = {}
-    for name in ("word/document.xml", "word/comments.xml", "word/commentsExtended.xml", "word/commentsIds.xml", "word/commentsExtensible.xml"):
-        if name in raw:
-            parts[name] = raw[name].decode("utf-8")
+    missing_pmids = [p for p in sorted(all_pmids, key=int) if p not in pmid_map]
+    no_pubmed = []
+    pmid_items = []
+    for pmid in missing_pmids:
+        article = pubmed_articles.get(pmid)
+        if article is None:
+            no_pubmed.append(pmid)
+        else:
+            pmid_items.append(pubmed_article_to_zotero_item(article))
 
-    old_doc = parts["word/document.xml"]
-    new_doc, body_stats = patch_document_xml(old_doc, pmid_map, doi_map)
-    # Everything before the document body must remain byte-for-byte unchanged.
-    if old_doc.split("<w:body>", 1)[0] != new_doc.split("<w:body>", 1)[0]:
-        raise RuntimeError("Safety check failed: Word XML namespace/header changed.")
-    parts["word/document.xml"] = new_doc
-    parts, comment_stats = add_comment_citations_and_replies(parts, pmid_map, doi_map)
+    doi_items = []
+    for doi in sorted(all_dois):
+        if doi in doi_map:
+            continue
+        meta = doi_metadata.get(doi) or {}
+        if meta.get("source") == "pubmed" and meta.get("article") is not None:
+            doi_items.append(pubmed_article_to_zotero_item(meta["article"]))
+        elif meta.get("source") == "crossref" and meta.get("message") is not None:
+            doi_items.append(crossref_message_to_zotero_item(meta["message"], doi))
 
-    # Structural XML validation before writing the ZIP.
-    ET.fromstring(parts["word/document.xml"].encode("utf-8"))
-    if "word/comments.xml" in parts:
-        ET.fromstring(parts["word/comments.xml"].encode("utf-8"))
+    if pmid_items:
+        print("\nAdding {} missing PubMed record(s) directly to Zotero...".format(len(pmid_items)))
+        try:
+            created, failures = post_zotero_items(pmid_items, collection_key=collection_key)
+            print("Added/confirmed {} of {} PubMed record(s).".format(created, len(pmid_items)))
+            if failures:
+                print("{} PubMed record(s) could not be auto-added; conversion will continue.".format(len(failures)))
+        except Exception as exc:
+            write_event("Could not start Zotero PubMed import: {}".format(exc))
 
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-        for name in names:
-            data = parts[name].encode("utf-8") if name in parts else raw[name]
-            zout.writestr(name, data)
-
-    # Re-open exactly what was written and verify it is a valid DOCX ZIP with
-    # live Zotero Word citation fields, not plain marker text.
-    with zipfile.ZipFile(output_path, "r") as test_zip:
-        bad = test_zip.testzip()
-        if bad:
-            raise RuntimeError("DOCX ZIP validation failed at {}".format(bad))
-        out_doc = test_zip.read("word/document.xml").decode("utf-8")
-        field_count = out_doc.count("ADDIN ZOTERO_ITEM CSL_CITATION")
-        if body_stats["locations"] and field_count < body_stats["locations"]:
-            raise RuntimeError("Citation field validation failed: expected at least {} live fields, found {}.".format(body_stats["locations"], field_count))
-
-    return body_stats, comment_stats, field_count
-
-
-def write_report(path, input_path, output_path, body_stats, comment_stats, field_count, full_ris_path=None, pubmed_records=0, import_collection_path=None):
-    lines = [
-        "DOCX -> live Zotero citation report", "=" * 36, "",
-        "Input:  {}".format(input_path), "Output: {}".format(output_path),
-        "PubMed RIS: {}".format(full_ris_path if full_ris_path else "not created"),
-        "PubMed records fetched: {}".format(pubmed_records),
-        "Document reference collection: {}".format(import_collection_path if import_collection_path else "unchanged"), "",
-        "Live Zotero Word fields in output: {}".format(field_count),
-        "Body citation locations converted: {}".format(body_stats["locations"]),
-        "Unique body identifiers converted: {}".format(len(set(body_stats["ids"]))),
-        "Comment citation items added:       {}".format(comment_stats["citations_added"]),
-        "Comments updated:                   {}".format(comment_stats["comments_updated"]),
-        "Threaded reply comments added:      {}".format(comment_stats["replies"]), "",
-    ]
-    if body_stats["manual"]:
-        lines += ["LEFT FOR MANUAL REVIEW:", ""] + ["  {}".format(x) for x in body_stats["manual"]] + [""]
-    unresolved_pmids = set(body_stats["missing_pmids"]) | set(comment_stats["missing_pmids"])
-    unresolved_dois = set(body_stats["missing_dois"]) | set(comment_stats["missing_dois"])
-    if unresolved_pmids:
-        lines += ["UNRESOLVED PMIDs LEFT UNCHANGED:", ""] + ["  {}".format(p) for p in sorted(unresolved_pmids, key=int)] + [""]
-    if unresolved_dois:
-        lines += ["UNRESOLVED DOIs LEFT UNCHANGED:", ""] + ["  {}".format(d) for d in sorted(unresolved_dois)] + [""]
-    if WRITE_EVENTS:
-        lines += ["ZOTERO WRITE DIAGNOSTICS:", ""] + ["  {}".format(x) for x in WRITE_EVENTS] + [""]
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def main():
-    if sys.version_info < (3, 8):
-        sys.exit("This tool requires Python 3.8 or newer.")
-
-    ap = argparse.ArgumentParser(
-        description="Fetch PubMed metadata, resolve references in Zotero, and write live Zotero citation fields into a DOCX."
-    )
-    ap.add_argument("docx")
-    ap.add_argument(
-        "--output-dir",
-        def
+    if doi_items:
+        print("\nAdding {} miss

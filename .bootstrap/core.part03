@@ -1,3 +1,60 @@
+:
+        query_raw = input("Type part of the existing collection name/path (blank = show all, / = cancel): ").strip()
+        if query_raw == "/":
+            return None, None
+        query = query_raw.casefold()
+        matches = [(path, key) for path, key in paths if not query or query in path.casefold()]
+        if not matches:
+            print("No matching collection was returned by Zotero in My Library.")
+            group_hits = _group_collection_hits(query_raw)
+            if group_hits:
+                print("However, Zotero reports matching collection(s) in GROUP libraries:")
+                for group_name, path, key, _prefix in group_hits[:20]:
+                    print("  Group {!r}: {} [key {}]".format(group_name, path, key))
+                print("A My Library item cannot use a group-library collection key. Group-library copying is a separate operation.")
+            print("Try another search, or choose / to cancel.")
+            continue
+        if len(matches) > 60:
+            print("{} matches; type a more specific search.".format(len(matches)))
+            continue
+
+        # A unique search result is unambiguous: validate it and use it immediately.
+        if len(matches) == 1:
+            path, key = matches[0]
+            data = _get_collection_data(key, "/users/0")
+            if not data:
+                print("Zotero no longer reports collection key {} in My Library. Refreshing the collection list.".format(key))
+                paths = zotero_collection_paths()
+                continue
+            actual_name = str(data.get("name") or "").strip()
+            print("Using existing collection: {}".format(path))
+            if actual_name and actual_name not in path:
+                print("Zotero reports collection name: {}".format(actual_name))
+            return key, path
+
+        for i, (path, key) in enumerate(matches, 1):
+            print("  {:>2}. {}  [key {}]".format(i, path, key))
+        raw = input("Choose collection number, or Enter to cancel: ").strip()
+        if not raw:
+            return None, None
+        try:
+            number = int(raw)
+        except ValueError:
+            print("Enter a number from the list.")
+            continue
+        if 1 <= number <= len(matches):
+            path, key = matches[number - 1]
+            # Validate the exact key immediately before any writes.
+            data = _get_collection_data(key, "/users/0")
+            if not data:
+                print("Zotero no longer reports collection key {} in My Library. Refreshing the collection list.".format(key))
+                paths = zotero_collection_paths()
+                continue
+            actual_name = str(data.get("name") or "").strip()
+            print("Validated My Library collection: {} [key {}]".format(path, key))
+            if actual_name and actual_name not in path:
+                print("Zotero reports collection name: {}".format(actual_name))
+            return key, path
         print("Enter a number from the list.")
 
 
@@ -135,109 +192,4 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
                 break
 
         if not done and not any(k == ref.key for k, _ in stats["failed"]):
-            stats["failed"].append((ref.key, "collection membership could not be verified"))
-
-    print("Collection result for this document: {} already there, {} added, {} failed.".format(
-        stats["already"], stats["added"], len(stats["failed"])
-    ))
-    if stats["failed"]:
-        for key, reason in stats["failed"]:
-            print("  Could not add {}: {}".format(key, reason))
-    return stats
-
-
-def item_label(data):
-    creators = [c for c in (data.get("creators") or []) if c.get("creatorType") in ("author", "bookAuthor", "editor", "contributor")]
-    names = []
-    for c in creators:
-        name = (c.get("lastName") or c.get("name") or c.get("firstName") or "").strip()
-        if name:
-            names.append(name)
-    if not names:
-        author = "Unknown author"
-    elif len(names) == 1:
-        author = names[0]
-    elif len(names) == 2:
-        author = "{} and {}".format(names[0], names[1])
-    else:
-        author = "{} et al.".format(names[0])
-    m = re.search(r"\b(?:18|19|20)\d{2}\b", str(data.get("date") or ""))
-    year = m.group(0) if m else "n.d."
-    return "{} ({})".format(author, year)
-
-
-def item_pmids(data):
-    out = set()
-    for field in ("extra", "archiveLocation", "url"):
-        value = str(data.get(field) or "")
-        out.update(m.group(1) for m in PMID_LABELED_RE.finditer(value))
-        out.update(m.group(1) for m in PUBMED_URL_RE.finditer(value))
-    if "pubmed" in str(data.get("archive") or "").lower():
-        m = PMID_RE.search(str(data.get("archiveLocation") or ""))
-        if m:
-            out.add(m.group(1))
-    return out
-
-
-def item_dois(data):
-    out = set()
-    direct = str(data.get("DOI") or "").strip()
-    if direct:
-        out.add(normalize_doi(direct))
-    for field in ("extra", "url"):
-        value = str(data.get(field) or "")
-        out.update(normalize_doi(m.group(1)) for m in DOI_RE.finditer(value))
-    return set(d for d in out if d)
-
-
-def normalize_title(value):
-    value = html.unescape(value or "")
-    value = re.sub(r"<[^>]+>", " ", value)
-    value = unicodedata.normalize("NFKC", value).casefold()
-    value = "".join(ch if ch.isalnum() else " " for ch in value)
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def year_from_data(data):
-    m = re.search(r"\b(?:18|19|20)\d{2}\b", str(data.get("date") or ""))
-    return m.group(0) if m else ""
-
-
-def first_author_from_data(data):
-    for c in data.get("creators") or []:
-        if c.get("creatorType") == "author":
-            return (c.get("lastName") or c.get("name") or "").strip().casefold()
-    return ""
-
-
-def zotero_item_uri(item, key):
-    library = item.get("library") or {}
-    library_type = str(library.get("type") or "")
-    library_id = library.get("id")
-    if library_type == "user" and library_id not in (None, "", 0, "0"):
-        return "http://zotero.org/users/{}/items/{}".format(library_id, key)
-    if library_type == "group" and library_id not in (None, ""):
-        return "http://zotero.org/groups/{}/items/{}".format(library_id, key)
-
-    # Local API item links normally contain the real numeric user/group id.
-    links = item.get("links") or {}
-    for link_name in ("self", "alternate"):
-        link = links.get(link_name) or {}
-        href = str(link.get("href") or "")
-        m = re.search(r"/(users|groups)/(\d+)/items/([A-Z0-9]+)", href, re.I)
-        if m:
-            kind, lib_id, item_key = m.groups()
-            base = "users" if kind.lower() == "users" else "groups"
-            return "http://zotero.org/{}/{}/items/{}".format(base, lib_id, item_key)
-
-    # Current ODF/DOCX Scan accepts zotero://select as a fallback URI, but the
-    # numeric canonical URI above is preferred for a true Word citation field.
-    return "zotero://select/library/items/{}".format(key)
-
-
-def build_ref(item):
-    data = item.get("data") or {}
-    if data.get("itemType") in ("attachment", "note", "annotation"):
-        return None
-    key = data.get("key") or item.get("key")
-    if not key:
+            stats["

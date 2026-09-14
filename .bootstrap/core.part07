@@ -1,246 +1,245 @@
+  pub = article.find("PubmedData")
+    art = med.find("Article") if med is not None else None
+
+    pmid = node_text(med.find("PMID")) if med is not None else ""
+    title = node_text(art.find("ArticleTitle")) if art is not None else ""
+    journal = ""
+    journal_abbrev = ""
+    year = ""
+    volume = ""
+    issue = ""
+    pages = ""
+    doi = ""
+
+    if art is not None:
+        journal_el = art.find("Journal")
+        if journal_el is not None:
+            journal = node_text(journal_el.find("Title"))
+            ji = journal_el.find("JournalIssue")
+            if ji is not None:
+                volume = node_text(ji.find("Volume"))
+                issue = node_text(ji.find("Issue"))
+                pd = ji.find("PubDate")
+                if pd is not None:
+                    year = node_text(pd.find("Year"))
+                    if not year:
+                        medline_date = node_text(pd.find("MedlineDate"))
+                        m = re.search(r"\b(?:18|19|20)\d{2}\b", medline_date)
+                        year = m.group(0) if m else ""
+        pages = node_text(art.find("Pagination/MedlinePgn"))
+
+    if med is not None:
+        mji = med.find("MedlineJournalInfo")
+        if mji is not None:
+            journal_abbrev = node_text(mji.find("MedlineTA"))
+
+    authors = []
+    if art is not None:
+        for au in art.findall("AuthorList/Author"):
+            group = node_text(au.find("CollectiveName"))
+            if group:
+                authors.append(group)
+                continue
+            last = node_text(au.find("LastName"))
+            fore = node_text(au.find("ForeName"))
+            initials = node_text(au.find("Initials"))
+            if last:
+                authors.append("{}, {}".format(last, fore or initials).strip(", "))
+
+    if pub is not None:
+        for aid in pub.findall("ArticleIdList/ArticleId"):
+            if (aid.attrib.get("IdType") or "").lower() == "doi":
+                doi = node_text(aid)
+                break
+
+    abstract_parts = []
+    if art is not None:
+        for ab in art.findall("Abstract/AbstractText"):
+            label = ab.attrib.get("Label")
+            text = node_text(ab)
+            if text:
+                abstract_parts.append("{}: {}".format(label, text) if label else text)
+
+    lines = ["TY  - JOUR"]
+    for author in authors:
+        lines.append("AU  - {}".format(clean_ris_text(author)))
+    if title:
+        lines.append("TI  - {}".format(clean_ris_text(title)))
+    if journal:
+        lines.append("JO  - {}".format(clean_ris_text(journal)))
+    if journal_abbrev:
+        lines.append("J2  - {}".format(clean_ris_text(journal_abbrev)))
+    if year:
+        lines.append("PY  - {}".format(year))
+    if volume:
+        lines.append("VL  - {}".format(volume))
+    if issue:
+        lines.append("IS  - {}".format(issue))
+    if pages:
+        lines.append("SP  - {}".format(pages))
+    if doi:
+        lines.append("DO  - {}".format(doi))
+    if pmid:
+        lines.append("AN  - PMID:{}".format(pmid))
+        lines.append("UR  - https://pubmed.ncbi.nlm.nih.gov/{}/".format(pmid))
+    if abstract_parts:
+        lines.append("AB  - {}".format(clean_ris_text(" ".join(abstract_parts))))
+    lines.append("ER  -")
+    return "\n".join(lines)
+
+
+
+
+def pubmed_article_to_zotero_item(article):
+    med = article.find("MedlineCitation")
+    pub = article.find("PubmedData")
+    art = med.find("Article") if med is not None else None
+    pmid = node_text(med.find("PMID")) if med is not None else ""
+    title = clean_ris_text(node_text(art.find("ArticleTitle"))) if art is not None else ""
+
+    item = {
+        "itemType": "journalArticle",
+        "title": title,
+        "creators": [],
+        "tags": [],
+        "collections": [],
+        "relations": {},
+    }
+
+    if art is not None:
+        for au in art.findall("AuthorList/Author"):
+            group = clean_ris_text(node_text(au.find("CollectiveName")))
+            if group:
+                item["creators"].append({"creatorType": "author", "name": group})
+                continue
+            last = clean_ris_text(node_text(au.find("LastName")))
+            first = clean_ris_text(node_text(au.find("ForeName")) or node_text(au.find("Initials")))
+            if last:
+                item["creators"].append({
+                    "creatorType": "author",
+                    "firstName": first,
+                    "lastName": last,
+                })
+
+        journal_el = art.find("Journal")
+        if journal_el is not None:
+            journal = clean_ris_text(node_text(journal_el.find("Title")))
+            if journal:
+                item["publicationTitle"] = journal
+            ji = journal_el.find("JournalIssue")
+            if ji is not None:
+                volume = node_text(ji.find("Volume"))
+                issue = node_text(ji.find("Issue"))
+                if volume:
+                    item["volume"] = volume
+                if issue:
+                    item["issue"] = issue
+                pd = ji.find("PubDate")
+                if pd is not None:
+                    year = node_text(pd.find("Year"))
+                    if not year:
+                        md = node_text(pd.find("MedlineDate"))
+                        m = re.search(r"\b(?:18|19|20)\d{2}\b", md)
+                        year = m.group(0) if m else ""
+                    if year:
+                        item["date"] = year
+        pages = node_text(art.find("Pagination/MedlinePgn"))
+        if pages:
+            item["pages"] = pages
+
+        abstract_parts = []
+        for ab in art.findall("Abstract/AbstractText"):
+            label = ab.attrib.get("Label")
+            text = clean_ris_text(node_text(ab))
+            if text:
+                abstract_parts.append("{}: {}".format(label, text) if label else text)
+        if abstract_parts:
+            item["abstractNote"] = " ".join(abstract_parts)
+
+    if med is not None:
+        mji = med.find("MedlineJournalInfo")
+        if mji is not None:
+            abbrev = clean_ris_text(node_text(mji.find("MedlineTA")))
+            if abbrev:
+                item["journalAbbreviation"] = abbrev
+
+    doi = ""
+    if pub is not None:
+        for aid in pub.findall("ArticleIdList/ArticleId"):
+            if (aid.attrib.get("IdType") or "").lower() == "doi":
+                doi = node_text(aid)
+                break
+    if doi:
+        item["DOI"] = doi
+    if pmid:
+        item["url"] = "https://pubmed.ncbi.nlm.nih.gov/{}/".format(pmid)
+        item["extra"] = "PMID: {}".format(pmid)
+
+    return item
+
+
+def fetch_crossref_message(doi):
+    """Fetch metadata for one DOI from Crossref as JSON."""
+    encoded = urllib.parse.quote(normalize_doi(doi), safe="")
+    url = "https://api.crossref.org/works/{}".format(encoded)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "PMID-DOCX-to-Zotero/3.1",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, dict):
+        raise RuntimeError("Crossref returned no metadata for DOI {}".format(doi))
+    return message
+
+
+def crossref_message_to_zotero_item(message, doi):
+    """Convert basic Crossref metadata to a Zotero item payload."""
+    crossref_type = str(message.get("type") or "")
+    item_type = "journalArticle"
+    if crossref_type == "book-chapter":
+        item_type = "bookSection"
+    elif crossref_type in ("book", "monograph", "reference-book"):
+        item_type = "book"
+    elif crossref_type in ("proceedings-article", "proceedings"):
+        item_type = "conferencePaper"
+    elif crossref_type in ("report", "report-series"):
+        item_type = "report"
+
+    titles = message.get("title") or []
+    title = clean_ris_text(titles[0] if titles else "")
+    item = {
+        "itemType": item_type,
+        "title": title,
+        "creators": [],
+        "tags": [],
+        "collections": [],
+        "relations": {},
+        "DOI": normalize_doi(doi),
+    }
+
+    for author in message.get("author") or []:
+        family = clean_ris_text(str(author.get("family") or ""))
+        given = clean_ris_text(str(author.get("given") or ""))
+        name = clean_ris_text(str(author.get("name") or ""))
+        if family:
+            item["creators"].append({
+                "creatorType": "author",
+                "firstName": given,
+                "lastName": family,
+            })
+        elif name:
+            item["creators"].append({"creatorType": "author", "name": name})
+
+    containers = message.get("container-title") or []
     container = clean_ris_text(containers[0] if containers else "")
     short_containers = message.get("short-container-title") or []
     short_container = clean_ris_text(short_containers[0] if short_containers else "")
 
     if item_type == "journalArticle":
         if container:
-            item["publicationTitle"] = container
-        if short_container:
-            item["journalAbbreviation"] = short_container
-    elif item_type == "bookSection" and container:
-        item["bookTitle"] = container
-    elif item_type == "conferencePaper" and container:
-        item["proceedingsTitle"] = container
-
-    for key, zotero_key in (("volume", "volume"), ("issue", "issue"), ("page", "pages"), ("publisher", "publisher")):
-        value = clean_ris_text(str(message.get(key) or ""))
-        if value:
-            item[zotero_key] = value
-
-    date_value = ""
-    for date_key in ("published-print", "published-online", "published", "issued"):
-        date_obj = message.get(date_key) or {}
-        parts = date_obj.get("date-parts") if isinstance(date_obj, dict) else None
-        if parts and parts[0]:
-            vals = [str(x) for x in parts[0] if x is not None]
-            if vals:
-                date_value = "-".join(vals)
-                break
-    if date_value:
-        item["date"] = date_value
-
-    url = clean_ris_text(str(message.get("URL") or ""))
-    if url:
-        item["url"] = url
-    abstract = str(message.get("abstract") or "")
-    if abstract:
-        abstract = re.sub(r"<[^>]+>", " ", abstract)
-        abstract = clean_ris_text(abstract)
-        if abstract:
-            item["abstractNote"] = abstract
-
-    return item
-
-
-def fetch_pubmed_articles(pmids, batch_size=150):
-    """Fetch PubMed metadata once and return it keyed by PMID."""
-    ordered = sorted(set(pmids), key=int)
-    articles = {}
-    for i in range(0, len(ordered), batch_size):
-        batch = ordered[i:i + batch_size]
-        params = urllib.parse.urlencode({
-            "db": "pubmed",
-            "id": ",".join(batch),
-            "retmode": "xml",
-        })
-        req = urllib.request.Request(
-            "{}?{}".format(EUTILS_FETCH, params),
-            headers={"User-Agent": "PMID-DOCX-to-Zotero/3.0"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as response:
-            root = ET.fromstring(response.read())
-        for article in root.findall("PubmedArticle"):
-            pmid = node_text(article.find("MedlineCitation/PMID"))
-            if pmid:
-                articles[pmid] = article
-        if i + batch_size < len(ordered):
-            time.sleep(0.35)
-    missing = [p for p in ordered if p not in articles]
-    return articles, missing
-
-
-def article_doi(article):
-    if article is None:
-        return ""
-    pub = article.find("PubmedData")
-    if pub is not None:
-        for aid in pub.findall("ArticleIdList/ArticleId"):
-            if (aid.attrib.get("IdType") or "").lower() == "doi":
-                return normalize_doi(node_text(aid))
-    return ""
-
-
-def fetch_pubmed_article_for_doi(doi):
-    """Resolve a DOI through PubMed first and verify the returned DOI."""
-    normalized = normalize_doi(doi)
-    params = urllib.parse.urlencode({
-        "db": "pubmed",
-        "term": "{}[AID]".format(normalized),
-        "retmode": "json",
-        "retmax": "10",
-    })
-    req = urllib.request.Request(
-        "{}?{}".format(EUTILS_SEARCH, params),
-        headers={"User-Agent": "PMID-DOCX-to-Zotero/4.0"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    ids = ((payload.get("esearchresult") or {}).get("idlist") or []) if isinstance(payload, dict) else []
-    if not ids:
-        return None
-    article_map, _ = fetch_pubmed_articles(ids)
-    for pmid in ids:
-        article = article_map.get(str(pmid))
-        if article is not None and article_doi(article) == normalized:
-            return article
-    return None
-
-
-def crossref_title_year_author(message):
-    titles = message.get("title") or []
-    title = clean_ris_text(titles[0] if titles else "")
-    year = ""
-    for date_key in ("published-print", "published-online", "published", "issued"):
-        date_obj = message.get(date_key) or {}
-        parts = date_obj.get("date-parts") if isinstance(date_obj, dict) else None
-        if parts and parts[0]:
-            year = str(parts[0][0]) if parts[0][0] is not None else ""
-            if year:
-                break
-    author = ""
-    authors = message.get("author") or []
-    if authors:
-        author = clean_ris_text(str(authors[0].get("family") or authors[0].get("name") or "")).casefold()
-    return title, year, author
-
-
-def report_document_match_status(all_pmids, all_dois, pmid_map, doi_map):
-    matched_pmids = len([p for p in all_pmids if p in pmid_map])
-    matched_dois = len([d for d in all_dois if d in doi_map])
-    print("Matched in Zotero for this document: {}/{} PMIDs; {}/{} DOIs.".format(
-        matched_pmids, len(all_pmids), matched_dois, len(all_dois)
-    ))
-
-
-def resolve_document_references(all_pmids, all_dois, pubmed_articles, requested_collection=None):
-    """Resolve only references in this DOCX and robustly import missing ones."""
-    pmid_map, doi_map, title_map, _ = load_zotero_index()
-    report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
-
-    # Collection choice applies to ALL resolved references used by this document,
-    # including items that were already in Zotero before this run.
-    collection_key, collection_path = (
-        resolve_requested_collection(requested_collection)
-        if requested_collection is not None
-        else choose_import_collection()
-    )
-
-    title_matches = []
-    for pmid in sorted(all_pmids, key=int):
-        if pmid in pmid_map:
-            continue
-        article = pubmed_articles.get(pmid)
-        if article is None:
-            continue
-        ref = choose_title_match(
-            article_title(article), title_map,
-            expected_year=article_year(article),
-            expected_author=article_first_author(article),
-        )
-        if ref:
-            pmid_map[pmid] = ref
-            doi = article_doi(article)
-            if doi:
-                doi_map.setdefault(doi, ref)
-            title_matches.append(("PMID {}".format(pmid), ref))
-
-    doi_metadata = {}
-    for doi in sorted(all_dois):
-        if doi in doi_map:
-            continue
-        article = None
-        try:
-            article = fetch_pubmed_article_for_doi(doi)
-        except Exception as exc:
-            print("  PubMed DOI lookup warning for {}: {}".format(doi, exc))
-        if article is not None:
-            meta = {
-                "source": "pubmed", "article": article,
-                "title": article_title(article), "year": article_year(article),
-                "author": article_first_author(article),
-            }
-        else:
-            try:
-                message = fetch_crossref_message(doi)
-                title, year, author = crossref_title_year_author(message)
-                meta = {
-                    "source": "crossref", "message": message,
-                    "title": title, "year": year, "author": author,
-                }
-            except Exception as exc:
-                meta = {"source": "none", "error": str(exc), "title": "", "year": "", "author": ""}
-        doi_metadata[doi] = meta
-        ref = choose_title_match(meta.get("title", ""), title_map, meta.get("year", ""), meta.get("author", ""))
-        if ref:
-            doi_map[doi] = ref
-            title_matches.append(("DOI {}".format(doi), ref))
-
-    if title_matches:
-        print("Matched {} document reference(s) to existing Zotero items by title.".format(len(title_matches)))
-        for identifier, ref in title_matches:
-            print("  {} -> {}".format(identifier, ref.label))
-
-    missing_pmids = [p for p in sorted(all_pmids, key=int) if p not in pmid_map]
-    no_pubmed = []
-    pmid_items = []
-    for pmid in missing_pmids:
-        article = pubmed_articles.get(pmid)
-        if article is None:
-            no_pubmed.append(pmid)
-        else:
-            pmid_items.append(pubmed_article_to_zotero_item(article))
-
-    doi_items = []
-    for doi in sorted(all_dois):
-        if doi in doi_map:
-            continue
-        meta = doi_metadata.get(doi) or {}
-        if meta.get("source") == "pubmed" and meta.get("article") is not None:
-            doi_items.append(pubmed_article_to_zotero_item(meta["article"]))
-        elif meta.get("source") == "crossref" and meta.get("message") is not None:
-            doi_items.append(crossref_message_to_zotero_item(meta["message"], doi))
-
-    if pmid_items:
-        print("\nAdding {} missing PubMed record(s) directly to Zotero...".format(len(pmid_items)))
-        try:
-            created, failures = post_zotero_items(pmid_items, collection_key=collection_key)
-            print("Added/confirmed {} of {} PubMed record(s).".format(created, len(pmid_items)))
-            if failures:
-                print("{} PubMed record(s) could not be auto-added; conversion will continue.".format(len(failures)))
-        except Exception as exc:
-            write_event("Could not start Zotero PubMed import: {}".format(exc))
-
-    if doi_items:
-        print("\nAdding {} missing DOI record(s) directly to Zotero...".format(len(doi_items)))
-        try:
-            created, failures = post_zotero_items(doi_items, collection_key=collection_key)
-            print("Added/confirmed {} of {} DOI record(s).".format(created, len(doi_items)))
-            if failures:
-                print("{} DOI record(s) could not be auto-added; conversion will continue.".format(len(failures)))
-        except Exception as exc:
-            write_event("Could not start Zotero DOI import: {}".format(exc))
-
-    fresh_pmid_map, fresh_doi_map, fresh_title_map, _ = load_zotero_index()
-    fresh_pmid_map.update(pmid_map)
-    fresh_doi_map.update(doi_map)
-    pmid_map = fresh_pmid_map
+           

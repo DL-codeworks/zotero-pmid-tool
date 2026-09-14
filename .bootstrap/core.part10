@@ -1,0 +1,111 @@
+.format(output_dir))
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    all_pmids, all_dois = all_identifiers_in_docx(input_path)
+    print("Found in this document/comments: {} PMID(s), {} DOI(s).".format(len(all_pmids), len(all_dois)))
+    pubmed_articles = {}
+    full_ris_path = None
+    pubmed_record_count = 0
+    if all_pmids:
+        print("Fetching PubMed metadata...")
+        try:
+            pubmed_articles, pubmed_not_returned = fetch_pubmed_articles(all_pmids)
+            if not args.no_ris:
+                full_ris_path = output_dir / "{}_pubmed_citations_{}.ris".format(input_path.stem, stamp)
+                pubmed_record_count = write_pubmed_ris(full_ris_path, all_pmids, pubmed_articles)
+                if pubmed_record_count:
+                    print("Created PubMed RIS with {} record(s):".format(pubmed_record_count))
+                    print(full_ris_path)
+                else:
+                    full_ris_path = None
+            else:
+                pubmed_record_count = len(pubmed_articles)
+            if pubmed_not_returned:
+                print("PubMed did not return: {}".format(", ".join(pubmed_not_returned)))
+        except Exception as exc:
+            print("PubMed metadata warning: {}".format(exc))
+            print("Continuing; unresolved identifiers can be ignored rather than aborting.")
+
+    print("\nResolving references against Zotero...")
+    import_collection_path = None
+    try:
+        pmid_map, doi_map, doi_metadata, no_pubmed, import_collection_path = resolve_document_references(
+            all_pmids, all_dois, pubmed_articles, requested_collection=args.collection
+        )
+    except CollectionSelectionError as exc:
+        sys.exit("Collection selection failed: {}".format(exc))
+    except Exception as exc:
+        print("Automatic Zotero resolution warning: {}".format(exc))
+        # Reads may still work even if an import failed.
+        pmid_map, doi_map, _, _ = load_zotero_index()
+        doi_metadata = {}
+        no_pubmed = []
+        import_collection_path = None
+
+    missing_pmids = set(p for p in all_pmids if p not in pmid_map)
+    missing_dois = set(d for d in all_dois if d not in doi_map)
+
+    # Never force a manual import. The user can re-check after fixing Zotero, or
+    # ignore unresolved identifiers and still get a finished DOCX. Unresolved
+    # citation groups are left exactly as they were in the source document.
+    while missing_pmids or missing_dois:
+        print("\n{} reference identifier(s) remain unresolved.".format(len(missing_pmids) + len(missing_dois)))
+        for p in sorted(missing_pmids, key=int):
+            title = article_title(pubmed_articles.get(p)) if pubmed_articles.get(p) is not None else ""
+            print("  PMID {}{}".format(p, " - " + title if title else ""))
+        for d in sorted(missing_dois):
+            meta = doi_metadata.get(d) or {}
+            title = meta.get("title", "")
+            print("  DOI {}{}".format(d, " - " + title if title else ""))
+        answer = input("[I] Ignore and finish  [R] Re-check Zotero  [Q] Quit  (default I): ").strip().lower()
+        if answer in ("", "i", "ignore"):
+            print("Leaving unresolved identifier text unchanged and finishing the document.")
+            break
+        if answer in ("q", "quit"):
+            return
+        if answer in ("r", "recheck"):
+            pmid_map, doi_map = refresh_document_maps(all_pmids, all_dois, pubmed_articles, doi_metadata)
+            report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
+            missing_pmids = set(p for p in all_pmids if p not in pmid_map)
+            missing_dois = set(d for d in all_dois if d not in doi_map)
+            continue
+        print("Unknown choice; use I, R, or Q.")
+
+    output_path = output_dir / "{}_zotero_citations_{}.docx".format(input_path.stem, stamp)
+    report_path = None if args.no_report else output_dir / "{}_zotero_citations_{}_REPORT.txt".format(input_path.stem, stamp)
+
+    try:
+        body_stats, comment_stats, field_count = rewrite_docx(input_path, output_path, pmid_map, doi_map)
+        if report_path is not None:
+            write_report(
+                report_path, input_path, output_path, body_stats, comment_stats,
+                field_count, full_ris_path, pubmed_record_count, import_collection_path,
+            )
+    except Exception as exc:
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+        sys.exit("Conversion failed: {}".format(exc))
+
+    print("\nDONE")
+    print("Created {} live Zotero Word citation field(s).".format(field_count))
+    print("Body citation locations converted: {}".format(body_stats["locations"]))
+    print("Comment citation items added: {}".format(comment_stats["citations_added"]))
+    if body_stats["missing_pmids"] or body_stats["missing_dois"] or comment_stats["missing_pmids"] or comment_stats["missing_dois"]:
+        if report_path is not None:
+            print("Some unresolved identifiers were left unchanged; see the report.")
+        else:
+            print("Some unresolved identifiers were left unchanged.")
+    print("\nCreated:")
+    if full_ris_path:
+        print(full_ris_path)
+    print(output_path)
+    if report_path is not None:
+        print(report_path)
+    print("\nOriginal DOCX was not changed.")
+
+
+if __name__ == "__main__":
+    main()

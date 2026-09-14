@@ -1,3 +1,59 @@
+tion paths only.
+
+    References resolved by this tool live in My Library, so their collection
+    membership must also point to a My Library collection key. Group-library
+    collections are a different library and cannot be used as membership keys
+    on My Library items.
+    """
+    return _collection_paths_for_prefix("/users/0")
+
+
+def _get_collection_data(collection_key, prefix="/users/0"):
+    obj, _headers, status, _elapsed = zotero_raw_request(
+        "GET", prefix + "/collections/{}?format=json".format(collection_key), timeout=20
+    )
+    if status == 404:
+        return None
+    if status >= 400:
+        raise RuntimeError(
+            "Could not read Zotero collection {} from {} (HTTP {}): {}".format(
+                collection_key, prefix, status, obj
+            )
+        )
+    if isinstance(obj, dict):
+        data = obj.get("data")
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _group_collection_hits(query):
+    """Diagnostic only: find same-named collections in group libraries."""
+    hits = []
+    try:
+        groups, _headers, status, _elapsed = zotero_raw_request(
+            "GET", "/users/0/groups?format=json", timeout=20
+        )
+    except Exception:
+        return hits
+    if status >= 400 or not isinstance(groups, list):
+        return hits
+
+    q = (query or "").casefold()
+    for g in groups:
+        data = g.get("data") if isinstance(g, dict) else None
+        data = data if isinstance(data, dict) else (g if isinstance(g, dict) else {})
+        gid = data.get("id") or data.get("groupID") or g.get("id") or g.get("groupID")
+        name = data.get("name") or g.get("name") or "Group {}".format(gid)
+        if gid is None:
+            continue
+        prefix = "/groups/{}".format(gid)
+        try:
+            paths = _collection_paths_for_prefix(prefix)
+        except Exception:
+            continue
+        for path, key in paths:
+            if not q or q in path.casefold():
                 hits.append((str(name), path, key, prefix))
     return hits
 
@@ -177,60 +233,4 @@ def choose_import_collection():
         print("No collections exist in My Library.")
         return None, None
 
-    while True:
-        query_raw = input("Type part of the existing collection name/path (blank = show all, / = cancel): ").strip()
-        if query_raw == "/":
-            return None, None
-        query = query_raw.casefold()
-        matches = [(path, key) for path, key in paths if not query or query in path.casefold()]
-        if not matches:
-            print("No matching collection was returned by Zotero in My Library.")
-            group_hits = _group_collection_hits(query_raw)
-            if group_hits:
-                print("However, Zotero reports matching collection(s) in GROUP libraries:")
-                for group_name, path, key, _prefix in group_hits[:20]:
-                    print("  Group {!r}: {} [key {}]".format(group_name, path, key))
-                print("A My Library item cannot use a group-library collection key. Group-library copying is a separate operation.")
-            print("Try another search, or choose / to cancel.")
-            continue
-        if len(matches) > 60:
-            print("{} matches; type a more specific search.".format(len(matches)))
-            continue
-
-        # A unique search result is unambiguous: validate it and use it immediately.
-        if len(matches) == 1:
-            path, key = matches[0]
-            data = _get_collection_data(key, "/users/0")
-            if not data:
-                print("Zotero no longer reports collection key {} in My Library. Refreshing the collection list.".format(key))
-                paths = zotero_collection_paths()
-                continue
-            actual_name = str(data.get("name") or "").strip()
-            print("Using existing collection: {}".format(path))
-            if actual_name and actual_name not in path:
-                print("Zotero reports collection name: {}".format(actual_name))
-            return key, path
-
-        for i, (path, key) in enumerate(matches, 1):
-            print("  {:>2}. {}  [key {}]".format(i, path, key))
-        raw = input("Choose collection number, or Enter to cancel: ").strip()
-        if not raw:
-            return None, None
-        try:
-            number = int(raw)
-        except ValueError:
-            print("Enter a number from the list.")
-            continue
-        if 1 <= number <= len(matches):
-            path, key = matches[number - 1]
-            # Validate the exact key immediately before any writes.
-            data = _get_collection_data(key, "/users/0")
-            if not data:
-                print("Zotero no longer reports collection key {} in My Library. Refreshing the collection list.".format(key))
-                paths = zotero_collection_paths()
-                continue
-            actual_name = str(data.get("name") or "").strip()
-            print("Validated My Library collection: {} [key {}]".format(path, key))
-            if actual_name and actual_name not in path:
-                print("Zotero reports collection name: {}".format(actual_name))
-            return key, path
+    while True

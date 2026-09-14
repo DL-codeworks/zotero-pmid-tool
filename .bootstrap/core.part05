@@ -1,3 +1,164 @@
+efs:
+        if ref.key not in seen:
+            seen.add(ref.key)
+            m = re.match(r"^(.*?) \(([^()]*)\)$", ref.label)
+            labels.append("{} {}".format(m.group(1), m.group(2)) if m else ref.label)
+    return "(" + "; ".join(labels) + ")"
+
+
+def build_citation_data(refs):
+    citation_items = []
+    seen = set()
+    for ref in refs:
+        if ref.key in seen:
+            continue
+        seen.add(ref.key)
+        citation_items.append({"uris": [ref.uri]})
+    display = provisional_citation(refs)
+    return {
+        "citationID": generate_citation_id(),
+        "properties": {
+            "formattedCitation": display,
+            "plainCitation": display,
+        },
+        "citationItems": citation_items,
+        "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+    }, display
+
+
+def escape_xml_text(value):
+    return xml_escape(value, {'"': '&quot;', "'": '&apos;'})
+
+
+def _run_properties_for_text_match(xml, match):
+    """Return the direct Word run formatting that owns one <w:t> match."""
+    prefix = xml[:match.start()]
+    run_starts = list(re.finditer(r'<w:r\b[^>]*>', prefix))
+    if not run_starts:
+        return ""
+    run_start = run_starts[-1].start()
+    if prefix.rfind("</w:r>") > run_start:
+        return ""
+    run_prefix = xml[run_start:match.start()]
+    prop_match = re.search(
+        r'(<w:rPr\b[^>]*/>|<w:rPr\b[^>]*>[\s\S]*?</w:rPr>)',
+        run_prefix,
+    )
+    return prop_match.group(1) if prop_match else ""
+
+
+def _styled_word_run(inner_xml, run_properties=""):
+    return '<w:r>{}{}</w:r>'.format(run_properties or "", inner_xml)
+
+
+def build_word_field_xml(refs, run_properties=""):
+    citation_data, display = build_citation_data(refs)
+    json_text = json.dumps(citation_data, ensure_ascii=False, separators=(",", ":"))
+    escaped_json = escape_xml_text(json_text)
+    escaped_display = escape_xml_text(display)
+    return (
+        _styled_word_run('<w:fldChar w:fldCharType="begin"/>', run_properties)
+        + _styled_word_run(
+            '<w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {} </w:instrText>'.format(escaped_json),
+            run_properties,
+        )
+        + _styled_word_run('<w:fldChar w:fldCharType="separate"/>', run_properties)
+        + _styled_word_run('<w:t>{}</w:t>'.format(escaped_display), run_properties)
+        + _styled_word_run('<w:fldChar w:fldCharType="end"/>', run_properties)
+    )
+
+
+def build_inline_field_insertion(refs, run_properties=""):
+    # Close the current Word text run, insert the Zotero field, then reopen
+    # ordinary text with the same formatting so insertion does not reset it.
+    return (
+        '</w:t></w:r>'
+        + build_word_field_xml(refs, run_properties)
+        + '<w:r>{}<w:t xml:space="preserve">'.format(run_properties or "")
+    )
+
+
+def find_replacements(text, pmid_map, doi_map):
+    replacements = []
+    missing_pmids = set()
+    missing_dois = set()
+    manual = []
+    protected = []
+
+    def ref_for(kind, value):
+        return pmid_map.get(value) if kind == "pmid" else doi_map.get(normalize_doi(value))
+
+    def overlaps(s, e):
+        return any(s < r.end and e > r.start for r in replacements)
+
+    # Parenthetical/bracketed groups first. PMID-only, DOI-only, and mixed
+    # groups all become one Zotero citation field containing multiple items.
+    for start, end in balanced_outer_spans(text):
+        chunk = text[start:end]
+        ids = identifiers_in_text(chunk)
+        if not ids:
+            continue
+        refs = []
+        missing = []
+        for _, _, kind, value in ids:
+            ref = ref_for(kind, value)
+            if ref:
+                refs.append(ref)
+            else:
+                missing.append((kind, value))
+        if missing:
+            for kind, value in missing:
+                (missing_pmids if kind == "pmid" else missing_dois).add(value)
+            protected.append((start, end))
+            continue
+
+        residual = strip_identifiers(chunk[1:-1])
+        normalized = re.sub(r"[^a-z]", "", residual.lower())
+        if not residual:
+            replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids]))
+        elif normalized == "addmore":
+            replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids], " [add more]"))
+        else:
+            protected.append((start, end))
+            manual.append(chunk)
+
+    def inside_protected(pos):
+        return any(s <= pos < e for s, e in protected)
+
+    # Explicit PMID clusters outside parentheses.
+    cluster_re = re.compile(r"\bPMID\s*:\s*(?P<body>\d{6,8}(?:\s*(?:[,;]\s*|\s+)\d{6,8})*)", re.I)
+    for m in cluster_re.finditer(text):
+        if overlaps(m.start(), m.end()) or inside_protected(m.start()):
+            continue
+        pmids = PMID_RE.findall(m.group("body"))
+        refs = [pmid_map.get(p) for p in pmids]
+        if any(r is None for r in refs):
+            missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
+            continue
+        replacements.append(Replacement(m.start(), m.end(), refs, pmids))
+
+    # Remaining standalone PMIDs and DOI strings.
+    for start, end, kind, value in identifiers_in_text(text):
+        if overlaps(start, end) or inside_protected(start):
+            continue
+        ref = ref_for(kind, value)
+        if ref:
+            replacements.append(Replacement(start, end, [ref], [value]))
+        else:
+            (missing_pmids if kind == "pmid" else missing_dois).add(value)
+
+    replacements.sort(key=lambda r: r.start)
+    return replacements, missing_pmids, missing_dois, manual
+
+
+def patch_paragraph(paragraph_xml, replacements):
+    matches = list(WT_RE.finditer(paragraph_xml))
+    if not matches or not replacements:
+        return paragraph_xml
+    texts = [html.unescape(m.group(2)) for m in matches]
+    run_properties = [_run_properties_for_text_match(paragraph_xml, m) for m in matches]
+    intervals = []
+    cursor = 0
     for i, text in enumerate(texts):
         intervals.append((i, cursor, cursor + len(text)))
         cursor += len(text)
@@ -8,10 +169,22 @@
         affected = [(i, s, e) for i, s, e in intervals if repl.start < e and repl.end > s]
         if not affected:
             continue
-        token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
-        token_fields[token] = build_inline_field_insertion(repl.refs)
         fi, fs, _ = affected[0]
         li, ls, _ = affected[-1]
+
+        # Prefer the text immediately before the citation. At the start of a
+        # paragraph, fall back to the run that contained the identifier itself.
+        style_index = fi
+        if repl.start > 0:
+            prior_pos = repl.start - 1
+            for idx, start, end in intervals:
+                if start <= prior_pos < end:
+                    style_index = idx
+                    break
+        style_xml = run_properties[style_index] if style_index < len(run_properties) else ""
+
+        token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
+        token_fields[token] = build_inline_field_insertion(repl.refs, style_xml)
         local_start = max(0, repl.start - fs)
         if fi == li:
             local_end = max(0, repl.end - fs)
@@ -55,203 +228,4 @@ def patch_document_xml(xml, pmid_map, doi_map):
         pieces.append(para)
         last = pm.end()
     pieces.append(xml[last:])
-    return "".join(pieces), stats
-
-
-def comment_records(comments_xml, comments_extended_xml):
-    parent_by_para = {}
-    for m in re.finditer(r'<w15:commentEx\b[^>]*\bw15:paraId="([0-9A-Fa-f]{8})"[^>]*>', comments_extended_xml):
-        tag = m.group(0)
-        p = re.search(r'\bw15:paraIdParent="([0-9A-Fa-f]{8})"', tag)
-        parent_by_para[m.group(1).upper()] = p.group(1).upper() if p else None
-    records = []
-    for m in COMMENT_RE.finditer(comments_xml):
-        body = m.group("body")
-        para_ids = re.findall(r'\bw14:paraId="([0-9A-Fa-f]{8})"', body)
-        if not para_ids:
-            continue
-        last_para = para_ids[-1].upper()
-        records.append({
-            "id": int(m.group("id")),
-            "text": visible_text(body),
-            "last_para": last_para,
-            "is_reply": bool(parent_by_para.get(last_para)),
-        })
-    return records
-
-
-def insert_before(xml, closing, snippet):
-    pos = xml.rfind(closing)
-    if pos < 0:
-        raise RuntimeError(f"Could not find {closing}")
-    return xml[:pos] + snippet + xml[pos:]
-
-
-def hex8(signed=False):
-    return f"{random.randint(0x10000000, 0x7FFFFFFE if signed else 0xFFFFFFFE):08X}"
-
-
-def append_refs_at_comment_anchor(document_xml, comment_id, refs):
-    """Append one live multi-item Zotero Word field at a comment anchor."""
-    cid = str(comment_id)
-    start_re = re.compile(r'<w:commentRangeStart\b[^>]*\bw:id="' + re.escape(cid) + r'"[^>]*/>')
-    end_re = re.compile(r'<w:commentRangeEnd\b[^>]*\bw:id="' + re.escape(cid) + r'"[^>]*/>')
-
-    sm = start_re.search(document_xml)
-    if not sm:
-        return document_xml, 0
-    em = end_re.search(document_xml, sm.end())
-    if not em:
-        return document_xml, 0
-
-    anchored_xml = document_xml[sm.end():em.start()]
-    refs_to_add = []
-    for ref in refs:
-        # URI and item key checks both work for existing Zotero fields.
-        if ref.uri in anchored_xml or ref.key in anchored_xml:
-            continue
-        if all(x.key != ref.key for x in refs_to_add):
-            refs_to_add.append(ref)
-    if not refs_to_add:
-        return document_xml, 0
-
-    payload = '<w:r><w:t xml:space="preserve"> </w:t></w:r>' + build_word_field_xml(refs_to_add)
-    document_xml = document_xml[:em.start()] + payload + document_xml[em.start():]
-    return document_xml, len(refs_to_add)
-
-
-def add_comment_citations_and_replies(parts, pmid_map, doi_map):
-    stats = {
-        "replies": 0,
-        "citations_added": 0,
-        "comments_updated": 0,
-        "pmids": set(),
-        "missing_pmids": set(),
-        "missing_dois": set(),
-    }
-    if "word/comments.xml" not in parts:
-        return parts, stats
-
-    reply_parts = [
-        "word/commentsExtended.xml",
-        "word/commentsIds.xml",
-        "word/commentsExtensible.xml",
-    ]
-    replies_supported = all(name in parts for name in reply_parts)
-
-    comments = parts["word/comments.xml"]
-    comments_ex = parts.get("word/commentsExtended.xml", "")
-    comments_ids = parts.get("word/commentsIds.xml", "")
-    comments_ext = parts.get("word/commentsExtensible.xml", "")
-    document_xml = parts["word/document.xml"]
-
-    records = comment_records(comments, comments_ex)
-    max_id = max([r["id"] for r in records] or [-1])
-    existing_replies = {
-        r["text"].strip()
-        for r in records
-        if r["is_reply"] and r["text"].strip().lower().startswith("citations added")
-    }
-
-    for rec in records:
-        if rec["is_reply"]:
-            continue
-
-        ids = identifiers_in_text(rec["text"])
-        if not ids:
-            continue
-
-        refs = []
-        missing = False
-        for _, _, kind, value in ids:
-            ref = pmid_map.get(value) if kind == "pmid" else doi_map.get(normalize_doi(value))
-            if ref:
-                refs.append(ref)
-                if kind == "pmid":
-                    stats["pmids"].add(value)
-            else:
-                missing = True
-                (stats["missing_pmids"] if kind == "pmid" else stats["missing_dois"]).add(value)
-
-        if missing or not refs:
-            continue
-
-        # De-duplicate references in the comment while preserving order.
-        unique_refs = []
-        seen = set()
-        for ref in refs:
-            if ref.key not in seen:
-                seen.add(ref.key)
-                unique_refs.append(ref)
-
-        document_xml, added_count = append_refs_at_comment_anchor(
-            document_xml, rec["id"], unique_refs
-        )
-        if added_count == 0:
-            continue
-
-        stats["citations_added"] += added_count
-        stats["comments_updated"] += 1
-
-        # The citation itself is the important part. A threaded reply is optional:
-        # add it only when this DOCX already has the modern Word comment metadata.
-        if not replies_supported:
-            continue
-
-        reply_labels = []
-        for ref in unique_refs:
-            label = ref.label.replace(", (", " (")
-            if label not in reply_labels:
-                reply_labels.append(label)
-        reply_text = "Citations added: " + "; ".join(reply_labels)
-        if reply_text.lower() in {x.lower() for x in existing_replies}:
-            continue
-
-        max_id += 1
-        para_id = hex8()
-        durable = hex8(signed=True)
-        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-        c = (
-            f'<w:comment w:id="{max_id}" w:author="Zotero PMID Tool" w:date="{now}" w:initials="ZPT">'
-            f'<w:p w14:paraId="{para_id}" w14:textId="77777777">'
-            f'<w:pPr><w:pStyle w:val="CommentText"/></w:pPr>'
-            f'<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:annotationRef/></w:r>'
-            f'<w:r><w:t xml:space="preserve">{xml_escape(reply_text)}</w:t></w:r>'
-            f'</w:p></w:comment>'
-        )
-        ce = f'<w15:commentEx w15:paraId="{para_id}" w15:paraIdParent="{rec["last_para"]}" w15:done="0"/>'
-        ci = f'<w16cid:commentId w16cid:paraId="{para_id}" w16cid:durableId="{durable}"/>'
-        cx = f'<w16cex:commentExtensible w16cex:durableId="{durable}" w16cex:dateUtc="{now}"/>'
-
-        comments = insert_before(comments, "</w:comments>", c)
-        comments_ex = insert_before(comments_ex, "</w15:commentsEx>", ce)
-        comments_ids = insert_before(comments_ids, "</w16cid:commentsIds>", ci)
-        comments_ext = insert_before(comments_ext, "</w16cex:commentsExtensible>", cx)
-        existing_replies.add(reply_text)
-        stats["replies"] += 1
-
-    parts["word/document.xml"] = document_xml
-    parts["word/comments.xml"] = comments
-    if replies_supported:
-        parts["word/commentsExtended.xml"] = comments_ex
-        parts["word/commentsIds.xml"] = comments_ids
-        parts["word/commentsExtensible.xml"] = comments_ext
-    return parts, stats
-
-def all_identifiers_in_docx(path):
-    """Collect PMID/DOI placeholders without joining unrelated Word paragraphs."""
-    pmids = set()
-    dois = set()
-
-    def collect_from_text(text):
-        for _, _, kind, value in identifiers_in_text(text):
-            if kind == "pmid":
-                pmids.add(value)
-            else:
-                dois.add(normalize_doi(value))
-
-    with zipfile.ZipFile(path, "r") as z:
-        if "word/document.xml" in z.namelist():
-            xml = z.read("word/document.xml").decode("utf-8", errors="replace")
-            # A DOI may legally contain parentheses and punctuation. Never concatenate
+    return "

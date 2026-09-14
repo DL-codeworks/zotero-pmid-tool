@@ -269,23 +269,4 @@ def post_zotero_items(items, collection_key=None, max_attempts=3, timeout=60):
             write_event("Zotero write {}/{} for {} (timeout {}s)...".format(attempt, max_attempts, label, timeout))
             try:
                 obj, response_headers, status, elapsed = zotero_raw_request(
-                    "POST",
-                    "/users/0/items",
-                    payload=[item],
-                    api_key=key,
-                    server_id=server_id,
-                    extra_headers={"Zotero-Write-Token": token},
-                    timeout=timeout,
-                )
-            except RuntimeError as exc:
-                message = str(exc)
-                write_event("{}".format(message))
-                if "TIMEOUT" in message:
-                    write_event("The request outcome is ambiguous, so checking Zotero before retrying...")
-                    try:
-                        found = _find_payload_in_zotero(item)
-                    except Exception as verify_exc:
-                        found = None
-                        write_event("Verification check also failed: {}".format(verify_exc))
-                    if found:
-                        write_event("{} is present in Zotero; treating the timed-out write as successful.".format(label))
+             
