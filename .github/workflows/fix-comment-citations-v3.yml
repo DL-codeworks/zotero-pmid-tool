@@ -1,0 +1,74 @@
+name: Fix comment citations v3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fix-comment-citations-v3.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply patch
+        run: python .bootstrap/fix_comments.py
+
+      - name: Verify
+        shell: bash
+        run: |
+          python -m py_compile pmid_docx_to_zotero.py gui.py
+          python - <<'PY'
+          import html
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          import pmid_docx_to_zotero as m
+
+          comments = '''<w:comments><w:comment w:id="1">
+          <w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p>
+          <w:p w14:paraId="00000002"><w:r><w:t>23685858</w:t></w:r></w:p>
+          <w:p w14:paraId="00000003"><w:r><w:t>29479311</w:t></w:r></w:p>
+          </w:comment></w:comments>'''
+          recs = m.comment_records(comments, '')
+          assert recs[0]['text'] == '12402102\n23685858\n29479311', recs
+          ids = [v for _, _, k, v in m.identifiers_in_text(recs[0]['text']) if k == 'pmid']
+          assert ids == ['12402102', '23685858', '29479311'], ids
+
+          with tempfile.TemporaryDirectory() as td:
+              p = Path(td) / 'x.docx'
+              with zipfile.ZipFile(p, 'w') as z:
+                  z.writestr('word/document.xml', '<w:document><w:body/></w:document>')
+                  z.writestr('word/comments.xml', comments)
+              pmids, _ = m.all_identifiers_in_docx(p)
+              assert pmids == {'12402102', '23685858', '29479311'}, pmids
+
+          existing = m.ZoteroRef('REF00090', 'Existing (2020)', 'Existing', 'http://zotero.org/users/1/items/REF00090')
+          extras = [
+              m.ZoteroRef('AAA00001', 'A (2001)', 'A', 'http://zotero.org/users/1/items/AAA00001'),
+              m.ZoteroRef('BBB00002', 'B (2002)', 'B', 'http://zotero.org/users/1/items/BBB00002'),
+              m.ZoteroRef('CCC00003', 'C (2003)', 'C', 'http://zotero.org/users/1/items/CCC00003'),
+          ]
+          field = m.build_word_field_xml([existing])
+          doc = '<w:document><w:body><w:p><w:commentRangeStart w:id="1"/>' + field + '<w:commentRangeEnd w:id="1"/></w:p></w:body></w:document>'
+          out, added = m.append_refs_at_comment_anchor(doc, 1, extras)
+          assert added == 3
+          assert out.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 1
+          decoded = html.unescape(out)
+          for ref in [existing] + extras:
+              assert ref.uri in decoded
+          print('Comment citation tests passed')
+          PY
+
+      - name: Commit source fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pmid_docx_to_zotero.py .bootstrap/core.part*
+          git commit -m "Fix comment reference insertion"
+          git push
