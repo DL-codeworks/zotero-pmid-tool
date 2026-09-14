@@ -1481,7 +1481,11 @@ def _zotero_bibliography_field_spans(document_xml):
     spans = []
     for instr in _INSTR_TEXT_RE.finditer(document_xml):
         code = html.unescape(instr.group("code"))
-        if "ADDIN ZOTERO_BIBL" not in code or "CSL_BIBLIOGRAPHY" not in code:
+        if "CSL_BIBLIOGRAPHY" not in code:
+            continue
+        # Zotero Word XML uses ZOTERO_BIBL; Zotero's integration layer
+        # represents the same field internally as BIBL ... CSL_BIBLIOGRAPHY.
+        if "ZOTERO_BIBL" not in code and not re.search(r"(?:^|\s)BIBL(?:\s|$)", code):
             continue
         span = _field_span_containing_instruction(document_xml, instr.start(), instr.end())
         if span and span not in spans:
@@ -1516,10 +1520,10 @@ def _bibliography_exclusion_spans(document_xml):
     ]
     spans = list(field_spans) + style_spans
 
-    # Plain-text bibliographies have no Zotero field. If neither official
-    # Zotero marker nor Word's Bibliography style exists, use the last
-    # conventional standalone heading (last avoids a TOC entry).
-    if not field_spans and not style_spans:
+    # Plain-text bibliographies have no Zotero field. When there is no
+    # Zotero field, use the last conventional standalone heading as a
+    # section boundary as well (last avoids a TOC entry).
+    if not field_spans:
         heading_start = None
         for pm in paragraphs:
             heading = re.sub(r"\s+", " ", visible_text(pm.group(0))).strip()
