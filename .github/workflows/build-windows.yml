@@ -28,8 +28,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Syntax check
-        run: python -m py_compile pmid_docx_to_zotero.py gui.py
+      - name: Syntax and entrypoint check
+        run: |
+          python -m py_compile pmid_docx_to_zotero.py gui.py
+          python -c "import pmid_docx_to_zotero as m; assert callable(getattr(m, 'main', None)), 'pmid_docx_to_zotero.main() is missing'; import gui; assert callable(getattr(gui, 'main', None)), 'gui.main() is missing'"
 
       - name: Install PyInstaller
         run: python -m pip install --upgrade pyinstaller
