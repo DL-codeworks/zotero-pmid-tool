@@ -78,7 +78,7 @@ jobs:
               r'^def build_word_field_xml\(refs\):.*?(?=^def find_replacements\()',
               re.M | re.S,
           )
-          text, count = field_pattern.subn(new_field_block + '\n\n', text, count=1)
+          text, count = field_pattern.subn(lambda _m: new_field_block + '\n\n', text, count=1)
           if count != 1:
               raise SystemExit('Could not patch build_word_field_xml block')
 
@@ -121,7 +121,7 @@ jobs:
               r'^        li, ls, _ = affected\[-1\]\n',
               re.M | re.S,
           )
-          text, count = paragraph_pattern.subn(paragraph_replacement, text, count=1)
+          text, count = paragraph_pattern.subn(lambda _m: paragraph_replacement, text, count=1)
           if count != 1:
               raise SystemExit('Could not patch patch_paragraph formatting block')
 
@@ -139,7 +139,7 @@ jobs:
           comment_replacement = textwrap.indent(comment_body, '    ') + '\n'
           text, count = re.subn(
               r'^    payload = .*build_word_field_xml\(refs_to_add\)\n',
-              comment_replacement,
+              lambda _m: comment_replacement,
               text,
               count=1,
               flags=re.M,
