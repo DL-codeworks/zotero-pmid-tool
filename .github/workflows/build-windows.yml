@@ -17,7 +17,7 @@ jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Check out repository
@@ -43,3 +43,14 @@ jobs:
           name: ZoteroPMIDTool-windows
           path: dist/ZoteroPMIDTool.exe
           if-no-files-found: error
+
+      - name: Create initial release
+        if: github.event_name == 'push' && github.event.pull_request == null
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v1.0.0 *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create v1.0.0 dist/ZoteroPMIDTool.exe --title "Zotero PMID Tool v1.0.0" --notes "Initial Windows release."
+          }
