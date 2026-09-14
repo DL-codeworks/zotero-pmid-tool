@@ -1,0 +1,149 @@
+    doi_map = fresh_doi_map
+
+    for pmid in all_pmids:
+        if pmid not in pmid_map and pubmed_articles.get(pmid) is not None:
+            article = pubmed_articles[pmid]
+            ref = choose_title_match(article_title(article), fresh_title_map, article_year(article), article_first_author(article))
+            if ref:
+                pmid_map[pmid] = ref
+    for doi in all_dois:
+        if doi not in doi_map:
+            meta = doi_metadata.get(doi) or {}
+            ref = choose_title_match(meta.get("title", ""), fresh_title_map, meta.get("year", ""), meta.get("author", ""))
+            if ref:
+                doi_map[doi] = ref
+
+    report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
+
+    if collection_key:
+        document_refs = []
+        seen_keys = set()
+        for pmid in all_pmids:
+            ref = pmid_map.get(pmid)
+            if ref is not None and ref.key not in seen_keys:
+                seen_keys.add(ref.key)
+                document_refs.append(ref)
+        for doi in all_dois:
+            ref = doi_map.get(doi)
+            if ref is not None and ref.key not in seen_keys:
+                seen_keys.add(ref.key)
+                document_refs.append(ref)
+        try:
+            ensure_refs_in_collection(document_refs, collection_key, collection_path)
+        except Exception as exc:
+            write_event("Collection assignment warning: {}".format(exc))
+
+    return pmid_map, doi_map, doi_metadata, no_pubmed, collection_path
+
+def write_pubmed_ris(path, pmids, article_map):
+    records = []
+    for pmid in sorted(set(pmids), key=int):
+        article = article_map.get(pmid)
+        if article is not None:
+            records.append(article_to_ris(article))
+    if not records:
+        return 0
+    path.write_text("\n\n".join(records) + "\n", encoding="utf-8")
+    return len(records)
+
+
+def refresh_document_maps(all_pmids, all_dois, pubmed_articles, doi_metadata):
+    pmid_map, doi_map, title_map, _ = load_zotero_index()
+    for pmid in all_pmids:
+        if pmid in pmid_map:
+            continue
+        article = pubmed_articles.get(pmid)
+        if article is None:
+            continue
+        ref = choose_title_match(article_title(article), title_map, article_year(article), article_first_author(article))
+        if ref:
+            pmid_map[pmid] = ref
+    for doi in all_dois:
+        if doi in doi_map:
+            continue
+        meta = doi_metadata.get(doi) or {}
+        ref = choose_title_match(meta.get("title", ""), title_map, meta.get("year", ""), meta.get("author", ""))
+        if ref:
+            doi_map[doi] = ref
+    return pmid_map, doi_map
+
+
+def rewrite_docx(input_path, output_path, pmid_map, doi_map):
+    with zipfile.ZipFile(input_path, "r") as zin:
+        names = zin.namelist()
+        raw = {name: zin.read(name) for name in names}
+    parts = {}
+    for name in ("word/document.xml", "word/comments.xml", "word/commentsExtended.xml", "word/commentsIds.xml", "word/commentsExtensible.xml"):
+        if name in raw:
+            parts[name] = raw[name].decode("utf-8")
+
+    old_doc = parts["word/document.xml"]
+    new_doc, body_stats = patch_document_xml(old_doc, pmid_map, doi_map)
+    # Everything before the document body must remain byte-for-byte unchanged.
+    if old_doc.split("<w:body>", 1)[0] != new_doc.split("<w:body>", 1)[0]:
+        raise RuntimeError("Safety check failed: Word XML namespace/header changed.")
+    parts["word/document.xml"] = new_doc
+    parts, comment_stats = add_comment_citations_and_replies(parts, pmid_map, doi_map)
+
+    # Structural XML validation before writing the ZIP.
+    ET.fromstring(parts["word/document.xml"].encode("utf-8"))
+    if "word/comments.xml" in parts:
+        ET.fromstring(parts["word/comments.xml"].encode("utf-8"))
+
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for name in names:
+            data = parts[name].encode("utf-8") if name in parts else raw[name]
+            zout.writestr(name, data)
+
+    # Re-open exactly what was written and verify it is a valid DOCX ZIP with
+    # live Zotero Word citation fields, not plain marker text.
+    with zipfile.ZipFile(output_path, "r") as test_zip:
+        bad = test_zip.testzip()
+        if bad:
+            raise RuntimeError("DOCX ZIP validation failed at {}".format(bad))
+        out_doc = test_zip.read("word/document.xml").decode("utf-8")
+        field_count = out_doc.count("ADDIN ZOTERO_ITEM CSL_CITATION")
+        if body_stats["locations"] and field_count < body_stats["locations"]:
+            raise RuntimeError("Citation field validation failed: expected at least {} live fields, found {}.".format(body_stats["locations"], field_count))
+
+    return body_stats, comment_stats, field_count
+
+
+def write_report(path, input_path, output_path, body_stats, comment_stats, field_count, full_ris_path=None, pubmed_records=0, import_collection_path=None):
+    lines = [
+        "DOCX -> live Zotero citation report", "=" * 36, "",
+        "Input:  {}".format(input_path), "Output: {}".format(output_path),
+        "PubMed RIS: {}".format(full_ris_path if full_ris_path else "not created"),
+        "PubMed records fetched: {}".format(pubmed_records),
+        "Document reference collection: {}".format(import_collection_path if import_collection_path else "unchanged"), "",
+        "Live Zotero Word fields in output: {}".format(field_count),
+        "Body citation locations converted: {}".format(body_stats["locations"]),
+        "Unique body identifiers converted: {}".format(len(set(body_stats["ids"]))),
+        "Comment citation items added:       {}".format(comment_stats["citations_added"]),
+        "Comments updated:                   {}".format(comment_stats["comments_updated"]),
+        "Threaded reply comments added:      {}".format(comment_stats["replies"]), "",
+    ]
+    if body_stats["manual"]:
+        lines += ["LEFT FOR MANUAL REVIEW:", ""] + ["  {}".format(x) for x in body_stats["manual"]] + [""]
+    unresolved_pmids = set(body_stats["missing_pmids"]) | set(comment_stats["missing_pmids"])
+    unresolved_dois = set(body_stats["missing_dois"]) | set(comment_stats["missing_dois"])
+    if unresolved_pmids:
+        lines += ["UNRESOLVED PMIDs LEFT UNCHANGED:", ""] + ["  {}".format(p) for p in sorted(unresolved_pmids, key=int)] + [""]
+    if unresolved_dois:
+        lines += ["UNRESOLVED DOIs LEFT UNCHANGED:", ""] + ["  {}".format(d) for d in sorted(unresolved_dois)] + [""]
+    if WRITE_EVENTS:
+        lines += ["ZOTERO WRITE DIAGNOSTICS:", ""] + ["  {}".format(x) for x in WRITE_EVENTS] + [""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main():
+    if sys.version_info < (3, 8):
+        sys.exit("This tool requires Python 3.8 or newer.")
+
+    ap = argparse.ArgumentParser(
+        description="Fetch PubMed metadata, resolve references in Zotero, and write live Zotero citation fields into a DOCX."
+    )
+    ap.add_argument("docx")
+    ap.add_argument(
+        "--output-dir",
+        def
