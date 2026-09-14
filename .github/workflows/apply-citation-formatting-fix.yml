@@ -19,35 +19,17 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
+          import textwrap
 
           path = Path('pmid_docx_to_zotero.py')
           text = path.read_text(encoding='utf-8')
 
-          old = '''def build_word_field_xml(refs):
-              citation_data, display = build_citation_data(refs)
-              json_text = json.dumps(citation_data, ensure_ascii=False, separators=(",", ":"))
-              escaped_json = escape_xml_text(json_text)
-              escaped_display = escape_xml_text(display)
-              return (
-                  '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
-                  '<w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {} </w:instrText></w:r>'
-                  '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
-                  '<w:r><w:t>{}</w:t></w:r>'
-                  '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
-              ).format(escaped_json, escaped_display)
-
-
-          def build_inline_field_insertion(refs):
-              # This intentionally mirrors the current ODF/DOCX Scan implementation:
-              # close the current Word text run, insert a complete Word field, then reopen
-              # a text run for whatever ordinary text follows.
-              return '</w:t></w:r>' + build_word_field_xml(refs) + '<w:r><w:t xml:space="preserve">'
-          '''.replace('          ', '')
-
-          new = '''def _run_properties_for_text_match(xml, match):
+          new_field_block = textwrap.dedent(r'''
+          def _run_properties_for_text_match(xml, match):
               """Return the direct Word run formatting that owns one <w:t> match."""
               prefix = xml[:match.start()]
-              run_starts = list(re.finditer(r'<w:r\\b[^>]*>', prefix))
+              run_starts = list(re.finditer(r'<w:r\b[^>]*>', prefix))
               if not run_starts:
                   return ""
               run_start = run_starts[-1].start()
@@ -55,7 +37,7 @@ jobs:
                   return ""
               run_prefix = xml[run_start:match.start()]
               prop_match = re.search(
-                  r'(<w:rPr\\b[^>]*/>|<w:rPr\\b[^>]*>[\\s\\S]*?</w:rPr>)',
+                  r'(<w:rPr\b[^>]*/>|<w:rPr\b[^>]*>[\s\S]*?</w:rPr>)',
                   run_prefix,
               )
               return prop_match.group(1) if prop_match else ""
@@ -90,87 +72,84 @@ jobs:
                   + build_word_field_xml(refs, run_properties)
                   + '<w:r>{}<w:t xml:space="preserve">'.format(run_properties or "")
               )
-          '''.replace('          ', '')
+          ''').lstrip()
 
-          if old not in text:
-              raise SystemExit('Could not find build_word_field_xml block to patch')
-          text = text.replace(old, new, 1)
+          field_pattern = re.compile(
+              r'^def build_word_field_xml\(refs\):.*?(?=^def find_replacements\()',
+              re.M | re.S,
+          )
+          text, count = field_pattern.subn(new_field_block + '\n\n', text, count=1)
+          if count != 1:
+              raise SystemExit('Could not patch build_word_field_xml block')
 
-          old = '''    texts = [html.unescape(m.group(2)) for m in matches]
-              intervals = []
-              cursor = 0
-              for i, text in enumerate(texts):
-                  intervals.append((i, cursor, cursor + len(text)))
-                  cursor += len(text)
+          paragraph_body = textwrap.dedent(r'''
+          texts = [html.unescape(m.group(2)) for m in matches]
+          run_properties = [_run_properties_for_text_match(paragraph_xml, m) for m in matches]
+          intervals = []
+          cursor = 0
+          for i, text in enumerate(texts):
+              intervals.append((i, cursor, cursor + len(text)))
+              cursor += len(text)
 
-              token_fields = {}
-              # Work right-to-left so offsets calculated from the original text remain valid.
-              for repl in reversed(replacements):
-                  affected = [(i, s, e) for i, s, e in intervals if repl.start < e and repl.end > s]
-                  if not affected:
-                      continue
-                  token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
-                  token_fields[token] = build_inline_field_insertion(repl.refs)
-                  fi, fs, _ = affected[0]
-                  li, ls, _ = affected[-1]
-          '''.replace('              ', '')
+          token_fields = {}
+          # Work right-to-left so offsets calculated from the original text remain valid.
+          for repl in reversed(replacements):
+              affected = [(i, s, e) for i, s, e in intervals if repl.start < e and repl.end > s]
+              if not affected:
+                  continue
+              fi, fs, _ = affected[0]
+              li, ls, _ = affected[-1]
 
-          new = '''    texts = [html.unescape(m.group(2)) for m in matches]
-              run_properties = [_run_properties_for_text_match(paragraph_xml, m) for m in matches]
-              intervals = []
-              cursor = 0
-              for i, text in enumerate(texts):
-                  intervals.append((i, cursor, cursor + len(text)))
-                  cursor += len(text)
+              # Prefer the text immediately before the citation. At the start of a
+              # paragraph, fall back to the run that contained the identifier itself.
+              style_index = fi
+              if repl.start > 0:
+                  prior_pos = repl.start - 1
+                  for idx, start, end in intervals:
+                      if start <= prior_pos < end:
+                          style_index = idx
+                          break
+              style_xml = run_properties[style_index] if style_index < len(run_properties) else ""
 
-              token_fields = {}
-              # Work right-to-left so offsets calculated from the original text remain valid.
-              for repl in reversed(replacements):
-                  affected = [(i, s, e) for i, s, e in intervals if repl.start < e and repl.end > s]
-                  if not affected:
-                      continue
-                  fi, fs, _ = affected[0]
-                  li, ls, _ = affected[-1]
+              token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
+              token_fields[token] = build_inline_field_insertion(repl.refs, style_xml)
+          ''').strip('\n')
+          paragraph_replacement = textwrap.indent(paragraph_body, '    ') + '\n'
+          paragraph_pattern = re.compile(
+              r'^    texts = \[html\.unescape\(m\.group\(2\)\) for m in matches\]\n'
+              r'.*?'
+              r'^        li, ls, _ = affected\[-1\]\n',
+              re.M | re.S,
+          )
+          text, count = paragraph_pattern.subn(paragraph_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit('Could not patch patch_paragraph formatting block')
 
-                  # Prefer the text immediately before the citation, as Word users expect
-                  # inserted citations to match the surrounding manuscript. At the start of
-                  # a paragraph, fall back to the run that contained the identifier itself.
-                  style_index = fi
-                  if repl.start > 0:
-                      prior_pos = repl.start - 1
-                      for idx, start, end in intervals:
-                          if start <= prior_pos < end:
-                              style_index = idx
-                              break
-                  style_xml = run_properties[style_index] if style_index < len(run_properties) else ""
-
-                  token = "ZOTEROFIELD_{}_{}".format(generate_citation_id(), len(token_fields))
-                  token_fields[token] = build_inline_field_insertion(repl.refs, style_xml)
-          '''.replace('              ', '')
-
-          if old not in text:
-              raise SystemExit('Could not find patch_paragraph block to patch')
-          text = text.replace(old, new, 1)
-
-          old = '''    payload = '<w:r><w:t xml:space="preserve"> </w:t></w:r>' + build_word_field_xml(refs_to_add)
-          '''.replace('          ', '')
-          new = '''    preceding_text = list(WT_RE.finditer(document_xml, 0, em.start()))
-              run_properties = (
-                  _run_properties_for_text_match(document_xml, preceding_text[-1])
-                  if preceding_text else ""
-              )
-              payload = (
-                  _styled_word_run('<w:t xml:space="preserve"> </w:t>', run_properties)
-                  + build_word_field_xml(refs_to_add, run_properties)
-              )
-          '''.replace('              ', '')
-          if old not in text:
-              raise SystemExit('Could not find comment citation payload to patch')
-          text = text.replace(old, new, 1)
+          comment_body = textwrap.dedent(r'''
+          preceding_text = list(WT_RE.finditer(document_xml, 0, em.start()))
+          run_properties = (
+              _run_properties_for_text_match(document_xml, preceding_text[-1])
+              if preceding_text else ""
+          )
+          payload = (
+              _styled_word_run('<w:t xml:space="preserve"> </w:t>', run_properties)
+              + build_word_field_xml(refs_to_add, run_properties)
+          )
+          ''').strip('\n')
+          comment_replacement = textwrap.indent(comment_body, '    ') + '\n'
+          text, count = re.subn(
+              r'^    payload = .*build_word_field_xml\(refs_to_add\)\n',
+              comment_replacement,
+              text,
+              count=1,
+              flags=re.M,
+          )
+          if count != 1:
+              raise SystemExit('Could not patch comment citation formatting')
 
           path.write_text(text, encoding='utf-8')
 
-          # Keep the connector-friendly bootstrap fragments synchronized with the real source.
+          # Keep connector-friendly bootstrap fragments synchronized with the source.
           root = Path('.bootstrap')
           for part in root.glob('core.part*'):
               part.unlink()
@@ -192,9 +171,15 @@ jobs:
           repl = m.Replacement(start, start + len('(123456)'), [ref], ['123456'])
           out = m.patch_paragraph(para, [repl])
           assert 'ADDIN ZOTERO_ITEM CSL_CITATION' in out
-          assert out.count(rpr) >= 3, out
+          assert out.count(rpr) >= 6, out
           assert '<w:r>{}<w:t xml:space="preserve"> after'.format(rpr) in out, out
-          print('Formatting inheritance test passed')
+
+          # When the identifier is in a separate unformatted run, use the preceding text run.
+          para2 = '<w:p><w:r>{}<w:t>Text before </w:t></w:r><w:r><w:t>(123456)</w:t></w:r></w:p>'.format(rpr)
+          start2 = len('Text before ')
+          out2 = m.patch_paragraph(para2, [m.Replacement(start2, start2 + 8, [ref], ['123456'])])
+          assert out2.count(rpr) >= 6, out2
+          print('Formatting inheritance tests passed')
           PY
 
       - name: Commit fix
