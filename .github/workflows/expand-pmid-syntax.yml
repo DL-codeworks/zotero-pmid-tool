@@ -1,0 +1,240 @@
+name: Expand PMID syntax handling
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/expand-pmid-syntax.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Expand PMID placeholder handling
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          path = Path('pmid_docx_to_zotero.py')
+          text = path.read_text(encoding='utf-8')
+
+          start = text.index('def balanced_outer_spans(')
+          end = text.index('\ndef strip_identifiers', start)
+          replacement = textwrap.dedent(r'''
+          def balanced_outer_spans(text):
+              stack = []
+              spans = []
+              pairs = {")": "(", "]": "[", "}": "{"}
+              for i, ch in enumerate(text):
+                  if ch in "([{":
+                      stack.append((ch, i))
+                  elif ch in ")]}":
+                      if stack and stack[-1][0] == pairs[ch]:
+                          _, start = stack.pop()
+                          if not stack:
+                              spans.append((start, i + 1))
+              return spans
+
+
+          def pmid_wrapper_spans(text):
+              """Return tolerant bracketed PMID groups, including mismatched bracket pairs."""
+              label = r"(?:PMIDs?|PubMed(?:\\s+IDs?)?)"
+              pattern = re.compile(
+                  r"(?P<open>[\\(\\[\\{])\\s*"
+                  r"(?P<body>(?:" + label + r"\\s*:?\\s*)?\\d{6,8}"
+                  r"(?:\\s*(?:[,;]\\s*|\\s+)(?:" + label + r"\\s*:?\\s*)?\\d{6,8})*)"
+                  r"\\s*(?P<close>[\\)\\]\\}])",
+                  re.I,
+              )
+              return [(m.start(), m.end(), m.group("body")) for m in pattern.finditer(text)]
+          ''').lstrip()
+          text = text[:start] + replacement + text[end:]
+
+          old = r'''def strip_identifiers(text):
+              text = DOI_RE.sub(" ", text)
+              text = re.sub(r"\b(?:PMID|PubMed(?:\s+ID)?)\s*:\s*", " ", text, flags=re.I)
+              text = PMID_RE.sub(" ", text)
+              return re.sub(r"[\s,;]+", "", text)
+          '''
+          new = r'''def strip_identifiers(text):
+              text = DOI_RE.sub(" ", text)
+              text = re.sub(r"\b(?:PMIDs?|PubMed(?:\s+IDs?)?)\s*:?\s*", " ", text, flags=re.I)
+              text = PMID_RE.sub(" ", text)
+              return re.sub(r"[\s,;]+", "", text)
+          '''
+          if old not in text:
+              raise SystemExit('Could not update strip_identifiers')
+          text = text.replace(old, new, 1)
+
+          marker_start = text.index('    # Parenthetical/bracketed groups first.', text.index('def find_replacements('))
+          marker_end = text.index('\n    def inside_protected', marker_start)
+          block = textwrap.indent(textwrap.dedent(r'''
+          # Tolerant PMID-only wrappers first. These intentionally accept any
+          # standard bracket family and mismatched pairs such as (12345678].
+          # The wrapper is placeholder punctuation, so consume it with the PMID(s).
+          for start, end, body in pmid_wrapper_spans(text):
+              ids = identifiers_in_text(body)
+              if not ids:
+                  continue
+              refs = []
+              missing = []
+              for _, _, kind, value in ids:
+                  ref = ref_for(kind, value)
+                  if ref:
+                      refs.append(ref)
+                  else:
+                      missing.append((kind, value))
+              if missing:
+                  for kind, value in missing:
+                      (missing_pmids if kind == "pmid" else missing_dois).add(value)
+                  protected.append((start, end))
+                  continue
+              replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids]))
+
+          # Properly balanced groups can also contain DOI references or mixtures of
+          # DOI and PMID references. They become one Zotero citation field.
+          for start, end in balanced_outer_spans(text):
+              if overlaps(start, end):
+                  continue
+              chunk = text[start:end]
+              ids = identifiers_in_text(chunk)
+              if not ids:
+                  continue
+              refs = []
+              missing = []
+              for _, _, kind, value in ids:
+                  ref = ref_for(kind, value)
+                  if ref:
+                      refs.append(ref)
+                  else:
+                      missing.append((kind, value))
+              if missing:
+                  for kind, value in missing:
+                      (missing_pmids if kind == "pmid" else missing_dois).add(value)
+                  protected.append((start, end))
+                  continue
+
+              residual = strip_identifiers(chunk[1:-1])
+              normalized = re.sub(r"[^a-z]", "", residual.lower())
+              if not residual:
+                  replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids]))
+              elif normalized == "addmore":
+                  replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids], " [add more]"))
+              else:
+                  protected.append((start, end))
+                  manual.append(chunk)
+          ''').lstrip('\n'), '    ')
+          text = text[:marker_start] + block.rstrip() + text[marker_end:]
+
+          cluster_start = text.index('    # Explicit PMID clusters outside parentheses.', text.index('def find_replacements('))
+          cluster_end = text.index('\n    # Remaining standalone PMIDs and DOI strings.', cluster_start)
+          cluster_block = textwrap.indent(textwrap.dedent(r'''
+          # Explicit PMID/PubMed labels outside brackets. A colon is optional and
+          # common plural forms are accepted.
+          cluster_re = re.compile(
+              r"\b(?:PMIDs?|PubMed(?:\s+IDs?)?)\s*:?\s*"
+              r"(?P<body>\d{6,8}(?:\s*(?:[,;]\s*|\s+)\d{6,8})*)",
+              re.I,
+          )
+          for m in cluster_re.finditer(text):
+              if overlaps(m.start(), m.end()) or inside_protected(m.start()):
+                  continue
+              pmids = PMID_RE.findall(m.group("body"))
+              refs = [pmid_map.get(p) for p in pmids]
+              if any(r is None for r in refs):
+                  missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
+                  protected.append((m.start(), m.end()))
+                  continue
+              replacements.append(Replacement(m.start(), m.end(), refs, pmids))
+
+          # Bare comma/semicolon PMID lists are also a single citation, even when
+          # they are not wrapped in brackets.
+          bare_cluster_re = re.compile(
+              r"(?<!\d)(?P<body>\d{6,8}(?:\s*[,;]\s*\d{6,8})+)(?!\d)"
+          )
+          for m in bare_cluster_re.finditer(text):
+              if overlaps(m.start(), m.end()) or inside_protected(m.start()):
+                  continue
+              pmids = PMID_RE.findall(m.group("body"))
+              refs = [pmid_map.get(p) for p in pmids]
+              if any(r is None for r in refs):
+                  missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
+                  protected.append((m.start(), m.end()))
+                  continue
+              replacements.append(Replacement(m.start(), m.end(), refs, pmids))
+          ''').lstrip('\n'), '    ')
+          text = text[:cluster_start] + cluster_block.rstrip() + text[cluster_end:]
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Verify PMID syntax handling
+        shell: bash
+        run: |
+          python -m py_compile pmid_docx_to_zotero.py gui.py
+          python - <<'PY'
+          import pmid_docx_to_zotero as m
+
+          a = m.ZoteroRef('AAAA1111', 'A (2020)', 'A', 'http://zotero.org/users/1/items/AAAA1111')
+          b = m.ZoteroRef('BBBB2222', 'B (2021)', 'B', 'http://zotero.org/users/1/items/BBBB2222')
+          pmids = {'23731077': a, '12402102': b}
+
+          one = [
+              '23731077',
+              '(23731077)',
+              '[23731077]',
+              '{23731077}',
+              '(23731077]',
+              '[23731077)',
+              '{23731077]',
+              'PMID: 23731077',
+              'PMID 23731077',
+              'PMIDs: 23731077',
+              'PubMed ID: 23731077',
+              '[PMID: 23731077]',
+          ]
+          for sample in one:
+              reps, mp, md, manual = m.find_replacements(sample, pmids, {})
+              assert len(reps) == 1, (sample, reps)
+              assert reps[0].start == 0 and reps[0].end == len(sample), (sample, reps[0].start, reps[0].end)
+              assert reps[0].identifiers == ['23731077'], (sample, reps[0].identifiers)
+              assert not mp and not md and not manual, (sample, mp, md, manual)
+
+          grouped = [
+              '(23731077, 12402102)',
+              '[23731077; 12402102]',
+              '(23731077, 12402102]',
+              '[PMID 23731077, PMID 12402102}',
+              '23731077, 12402102',
+              '23731077; 12402102',
+              'PMIDs: 23731077, 12402102',
+          ]
+          for sample in grouped:
+              reps, mp, md, manual = m.find_replacements(sample, pmids, {})
+              assert len(reps) == 1, (sample, reps)
+              assert reps[0].start == 0 and reps[0].end == len(sample), (sample, reps[0].start, reps[0].end)
+              assert reps[0].identifiers == ['23731077', '12402102'], (sample, reps[0].identifiers)
+              assert not mp and not md and not manual, (sample, mp, md, manual)
+
+          sample = 'See 23731077 for details.'
+          reps, _, _, _ = m.find_replacements(sample, pmids, {})
+          assert len(reps) == 1
+          assert sample[reps[0].start:reps[0].end] == '23731077'
+          print('PMID syntax tests passed')
+          PY
+
+      - name: Commit source update
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pmid_docx_to_zotero.py
+          git commit -m "Handle common PMID placeholder formats"
+          git push
