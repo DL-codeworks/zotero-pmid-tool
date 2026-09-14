@@ -33,6 +33,33 @@ jobs:
           python -m py_compile pmid_docx_to_zotero.py gui.py
           python -c "import pmid_docx_to_zotero as m; assert callable(getattr(m, 'main', None)), 'pmid_docx_to_zotero.main() is missing'; import gui; assert callable(getattr(gui, 'main', None)), 'gui.main() is missing'"
 
+      - name: Comment citation regression check
+        shell: pwsh
+        run: |
+          @'
+          import html
+          import pmid_docx_to_zotero as m
+
+          comments = '<w:comments><w:comment w:id="1"><w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p><w:p w14:paraId="00000002"><w:r><w:t>23685858</w:t></w:r></w:p><w:p w14:paraId="00000003"><w:r><w:t>29479311</w:t></w:r></w:p></w:comment></w:comments>'
+          recs = m.comment_records(comments, '')
+          assert recs[0]['text'] == '12402102\n23685858\n29479311'
+
+          existing = m.ZoteroRef('REF00090', 'Existing (2020)', 'Existing', 'http://zotero.org/users/1/items/REF00090')
+          extras = [
+              m.ZoteroRef('AAA00001', 'A (2001)', 'A', 'http://zotero.org/users/1/items/AAA00001'),
+              m.ZoteroRef('BBB00002', 'B (2002)', 'B', 'http://zotero.org/users/1/items/BBB00002'),
+              m.ZoteroRef('CCC00003', 'C (2003)', 'C', 'http://zotero.org/users/1/items/CCC00003'),
+          ]
+          field = m.build_word_field_xml([existing])
+          doc = '<w:document><w:body><w:p><w:commentRangeStart w:id="1"/>' + field + '<w:commentRangeEnd w:id="1"/></w:p></w:body></w:document>'
+          out, added = m.append_refs_at_comment_anchor(doc, 1, extras)
+          assert added == 3
+          assert out.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 1
+          decoded = html.unescape(out)
+          for ref in [existing] + extras:
+              assert ref.uri in decoded
+          '@ | python -
+
       - name: Install PyInstaller
         run: python -m pip install --upgrade pyinstaller
 
@@ -52,7 +79,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view v1.0.3 *> $null
+          gh release view v1.0.4 *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create v1.0.3 dist/ZoteroPMIDTool.exe --title "Zotero PMID Tool v1.0.3" --notes "Inserted Zotero citations now inherit the surrounding document formatting, using the preceding text run as the default instead of Word's default font and size."
+            gh release create v1.0.4 dist/ZoteroPMIDTool.exe --title "Zotero PMID Tool v1.0.4" --notes "Fixes references listed on separate lines in Word comments and merges comment-requested references into the Zotero citation the comment is attached to."
           }
