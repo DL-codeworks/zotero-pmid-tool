@@ -23,30 +23,31 @@ jobs:
           p = Path('pmid_docx_to_zotero.py')
           s = p.read_text(encoding='utf-8')
 
-          old = '''        if "ADDIN ZOTERO_BIBL" not in code or "CSL_BIBLIOGRAPHY" not in code:
-              continue
-          '''
-          new = '''        if "CSL_BIBLIOGRAPHY" not in code:
-              continue
-              # Zotero's Word XML uses ZOTERO_BIBL; Zotero's integration layer
-              # represents the same field internally as BIBL ... CSL_BIBLIOGRAPHY.
-              if "ZOTERO_BIBL" not in code and not re.search(r"(?:^|\\s)BIBL(?:\\s|$)", code):
-                  continue
-          '''
+          old = '        if "ADDIN ZOTERO_BIBL" not in code or "CSL_BIBLIOGRAPHY" not in code:\n            continue\n'
+          new = (
+              '        if "CSL_BIBLIOGRAPHY" not in code:\n'
+              '            continue\n'
+              '        # Zotero Word XML uses ZOTERO_BIBL; Zotero\'s integration layer\n'
+              '        # represents the same field internally as BIBL ... CSL_BIBLIOGRAPHY.\n'
+              '        if "ZOTERO_BIBL" not in code and not re.search(r"(?:^|\\s)BIBL(?:\\s|$)", code):\n'
+              '            continue\n'
+          )
           if old not in s:
               raise SystemExit('bibliography code condition not found')
           s = s.replace(old, new, 1)
 
-          old = '''    # Plain-text bibliographies have no Zotero field. If neither official
-              # Zotero marker nor Word's Bibliography style exists, use the last
-              # conventional standalone heading (last avoids a TOC entry).
-              if not field_spans and not style_spans:
-          '''
-          new = '''    # Plain-text bibliographies have no Zotero field. When there is no
-              # Zotero field, use the last conventional standalone heading as a
-              # section boundary as well (last avoids a TOC entry).
-              if not field_spans:
-          '''
+          old = (
+              '    # Plain-text bibliographies have no Zotero field. If neither official\n'
+              '    # Zotero marker nor Word\'s Bibliography style exists, use the last\n'
+              '    # conventional standalone heading (last avoids a TOC entry).\n'
+              '    if not field_spans and not style_spans:\n'
+          )
+          new = (
+              '    # Plain-text bibliographies have no Zotero field. When there is no\n'
+              '    # Zotero field, use the last conventional standalone heading as a\n'
+              '    # section boundary as well (last avoids a TOC entry).\n'
+              '    if not field_spans:\n'
+          )
           if old not in s:
               raise SystemExit('heading fallback block not found')
           s = s.replace(old, new, 1)
