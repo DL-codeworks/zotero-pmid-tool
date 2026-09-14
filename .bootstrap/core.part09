@@ -1,4 +1,102 @@
-ing DOI record(s) directly to Zotero...".format(len(doi_items)))
+OCX and robustly import missing ones."""
+    pmid_map, doi_map, title_map, _ = load_zotero_index()
+    report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
+
+    # Collection choice applies to ALL resolved references used by this document,
+    # including items that were already in Zotero before this run.
+    collection_key, collection_path = (
+        resolve_requested_collection(requested_collection)
+        if requested_collection is not None
+        else choose_import_collection()
+    )
+
+    title_matches = []
+    for pmid in sorted(all_pmids, key=int):
+        if pmid in pmid_map:
+            continue
+        article = pubmed_articles.get(pmid)
+        if article is None:
+            continue
+        ref = choose_title_match(
+            article_title(article), title_map,
+            expected_year=article_year(article),
+            expected_author=article_first_author(article),
+        )
+        if ref:
+            pmid_map[pmid] = ref
+            doi = article_doi(article)
+            if doi:
+                doi_map.setdefault(doi, ref)
+            title_matches.append(("PMID {}".format(pmid), ref))
+
+    doi_metadata = {}
+    for doi in sorted(all_dois):
+        if doi in doi_map:
+            continue
+        article = None
+        try:
+            article = fetch_pubmed_article_for_doi(doi)
+        except Exception as exc:
+            print("  PubMed DOI lookup warning for {}: {}".format(doi, exc))
+        if article is not None:
+            meta = {
+                "source": "pubmed", "article": article,
+                "title": article_title(article), "year": article_year(article),
+                "author": article_first_author(article),
+            }
+        else:
+            try:
+                message = fetch_crossref_message(doi)
+                title, year, author = crossref_title_year_author(message)
+                meta = {
+                    "source": "crossref", "message": message,
+                    "title": title, "year": year, "author": author,
+                }
+            except Exception as exc:
+                meta = {"source": "none", "error": str(exc), "title": "", "year": "", "author": ""}
+        doi_metadata[doi] = meta
+        ref = choose_title_match(meta.get("title", ""), title_map, meta.get("year", ""), meta.get("author", ""))
+        if ref:
+            doi_map[doi] = ref
+            title_matches.append(("DOI {}".format(doi), ref))
+
+    if title_matches:
+        print("Matched {} document reference(s) to existing Zotero items by title.".format(len(title_matches)))
+        for identifier, ref in title_matches:
+            print("  {} -> {}".format(identifier, ref.label))
+
+    missing_pmids = [p for p in sorted(all_pmids, key=int) if p not in pmid_map]
+    no_pubmed = []
+    pmid_items = []
+    for pmid in missing_pmids:
+        article = pubmed_articles.get(pmid)
+        if article is None:
+            no_pubmed.append(pmid)
+        else:
+            pmid_items.append(pubmed_article_to_zotero_item(article))
+
+    doi_items = []
+    for doi in sorted(all_dois):
+        if doi in doi_map:
+            continue
+        meta = doi_metadata.get(doi) or {}
+        if meta.get("source") == "pubmed" and meta.get("article") is not None:
+            doi_items.append(pubmed_article_to_zotero_item(meta["article"]))
+        elif meta.get("source") == "crossref" and meta.get("message") is not None:
+            doi_items.append(crossref_message_to_zotero_item(meta["message"], doi))
+
+    if pmid_items:
+        print("\nAdding {} missing PubMed record(s) directly to Zotero...".format(len(pmid_items)))
+        try:
+            created, failures = post_zotero_items(pmid_items, collection_key=collection_key)
+            print("Added/confirmed {} of {} PubMed record(s).".format(created, len(pmid_items)))
+            if failures:
+                print("{} PubMed record(s) could not be auto-added; conversion will continue.".format(len(failures)))
+        except Exception as exc:
+            write_event("Could not start Zotero PubMed import: {}".format(exc))
+
+    if doi_items:
+        print("\nAdding {} missing DOI record(s) directly to Zotero...".format(len(doi_items)))
         try:
             created, failures = post_zotero_items(doi_items, collection_key=collection_key)
             print("Added/confirmed {} of {} DOI record(s).".format(created, len(doi_items)))
@@ -110,86 +208,4 @@ def rewrite_docx(input_path, output_path, pmid_map, doi_map):
 
     # Re-open exactly what was written and verify it is a valid DOCX ZIP with
     # live Zotero Word citation fields, not plain marker text.
-    with zipfile.ZipFile(output_path, "r") as test_zip:
-        bad = test_zip.testzip()
-        if bad:
-            raise RuntimeError("DOCX ZIP validation failed at {}".format(bad))
-        out_doc = test_zip.read("word/document.xml").decode("utf-8")
-        field_count = out_doc.count("ADDIN ZOTERO_ITEM CSL_CITATION")
-        if body_stats["locations"] and field_count < body_stats["locations"]:
-            raise RuntimeError("Citation field validation failed: expected at least {} live fields, found {}.".format(body_stats["locations"], field_count))
-
-    return body_stats, comment_stats, field_count
-
-
-def write_report(path, input_path, output_path, body_stats, comment_stats, field_count, full_ris_path=None, pubmed_records=0, import_collection_path=None):
-    lines = [
-        "DOCX -> live Zotero citation report", "=" * 36, "",
-        "Input:  {}".format(input_path), "Output: {}".format(output_path),
-        "PubMed RIS: {}".format(full_ris_path if full_ris_path else "not created"),
-        "PubMed records fetched: {}".format(pubmed_records),
-        "Document reference collection: {}".format(import_collection_path if import_collection_path else "unchanged"), "",
-        "Live Zotero Word fields in output: {}".format(field_count),
-        "Body citation locations converted: {}".format(body_stats["locations"]),
-        "Unique body identifiers converted: {}".format(len(set(body_stats["ids"]))),
-        "Comment citation items added:       {}".format(comment_stats["citations_added"]),
-        "Comments updated:                   {}".format(comment_stats["comments_updated"]),
-        "Threaded reply comments added:      {}".format(comment_stats["replies"]), "",
-    ]
-    if body_stats["manual"]:
-        lines += ["LEFT FOR MANUAL REVIEW:", ""] + ["  {}".format(x) for x in body_stats["manual"]] + [""]
-    unresolved_pmids = set(body_stats["missing_pmids"]) | set(comment_stats["missing_pmids"])
-    unresolved_dois = set(body_stats["missing_dois"]) | set(comment_stats["missing_dois"])
-    if unresolved_pmids:
-        lines += ["UNRESOLVED PMIDs LEFT UNCHANGED:", ""] + ["  {}".format(p) for p in sorted(unresolved_pmids, key=int)] + [""]
-    if unresolved_dois:
-        lines += ["UNRESOLVED DOIs LEFT UNCHANGED:", ""] + ["  {}".format(d) for d in sorted(unresolved_dois)] + [""]
-    if WRITE_EVENTS:
-        lines += ["ZOTERO WRITE DIAGNOSTICS:", ""] + ["  {}".format(x) for x in WRITE_EVENTS] + [""]
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def main():
-    if sys.version_info < (3, 8):
-        sys.exit("This tool requires Python 3.8 or newer.")
-
-    ap = argparse.ArgumentParser(
-        description="Fetch PubMed metadata, resolve references in Zotero, and write live Zotero citation fields into a DOCX."
-    )
-    ap.add_argument("docx")
-    ap.add_argument(
-        "--output-dir",
-        default=None,
-        help="Folder for generated files (default: same folder as the input DOCX).",
-    )
-    ap.add_argument(
-        "--no-ris",
-        action="store_true",
-        help="Do not create the optional PubMed RIS backup/export.",
-    )
-    ap.add_argument(
-        "--no-report",
-        action="store_true",
-        help="Do not create the optional conversion report text file.",
-    )
-    ap.add_argument(
-        "--collection",
-        default=None,
-        help=(
-            "Put document references in this Zotero My Library collection. "
-            "A unique existing name/path is used automatically; if no collection matches, "
-            "a new top-level collection is created with this name."
-        ),
-    )
-    args = ap.parse_args()
-    input_path = Path(args.docx).expanduser().resolve()
-    if not input_path.exists() or input_path.suffix.lower() != ".docx":
-        sys.exit("Choose an existing .docx file.")
-
-    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else input_path.parent
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        sys.exit("Could not create/access output folder {}: {}".format(output_dir, exc))
-    if not output_dir.is_dir():
-        sys.exit("Output location is not a folder: {}"
+    with zipfile.ZipFile(output_path, "r") as test

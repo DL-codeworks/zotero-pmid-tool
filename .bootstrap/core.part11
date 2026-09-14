@@ -1,0 +1,16 @@
+_dois"] or comment_stats["missing_pmids"] or comment_stats["missing_dois"]:
+        if report_path is not None:
+            print("Some unresolved identifiers were left unchanged; see the report.")
+        else:
+            print("Some unresolved identifiers were left unchanged.")
+    print("\nCreated:")
+    if full_ris_path:
+        print(full_ris_path)
+    print(output_path)
+    if report_path is not None:
+        print(report_path)
+    print("\nOriginal DOCX was not changed.")
+
+
+if __name__ == "__main__":
+    main()

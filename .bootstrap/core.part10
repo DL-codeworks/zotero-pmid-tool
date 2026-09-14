@@ -1,4 +1,86 @@
-.format(output_dir))
+_zip:
+        bad = test_zip.testzip()
+        if bad:
+            raise RuntimeError("DOCX ZIP validation failed at {}".format(bad))
+        out_doc = test_zip.read("word/document.xml").decode("utf-8")
+        field_count = out_doc.count("ADDIN ZOTERO_ITEM CSL_CITATION")
+        if body_stats["locations"] and field_count < body_stats["locations"]:
+            raise RuntimeError("Citation field validation failed: expected at least {} live fields, found {}.".format(body_stats["locations"], field_count))
+
+    return body_stats, comment_stats, field_count
+
+
+def write_report(path, input_path, output_path, body_stats, comment_stats, field_count, full_ris_path=None, pubmed_records=0, import_collection_path=None):
+    lines = [
+        "DOCX -> live Zotero citation report", "=" * 36, "",
+        "Input:  {}".format(input_path), "Output: {}".format(output_path),
+        "PubMed RIS: {}".format(full_ris_path if full_ris_path else "not created"),
+        "PubMed records fetched: {}".format(pubmed_records),
+        "Document reference collection: {}".format(import_collection_path if import_collection_path else "unchanged"), "",
+        "Live Zotero Word fields in output: {}".format(field_count),
+        "Body citation locations converted: {}".format(body_stats["locations"]),
+        "Unique body identifiers converted: {}".format(len(set(body_stats["ids"]))),
+        "Comment citation items added:       {}".format(comment_stats["citations_added"]),
+        "Comments updated:                   {}".format(comment_stats["comments_updated"]),
+        "Threaded reply comments added:      {}".format(comment_stats["replies"]), "",
+    ]
+    if body_stats["manual"]:
+        lines += ["LEFT FOR MANUAL REVIEW:", ""] + ["  {}".format(x) for x in body_stats["manual"]] + [""]
+    unresolved_pmids = set(body_stats["missing_pmids"]) | set(comment_stats["missing_pmids"])
+    unresolved_dois = set(body_stats["missing_dois"]) | set(comment_stats["missing_dois"])
+    if unresolved_pmids:
+        lines += ["UNRESOLVED PMIDs LEFT UNCHANGED:", ""] + ["  {}".format(p) for p in sorted(unresolved_pmids, key=int)] + [""]
+    if unresolved_dois:
+        lines += ["UNRESOLVED DOIs LEFT UNCHANGED:", ""] + ["  {}".format(d) for d in sorted(unresolved_dois)] + [""]
+    if WRITE_EVENTS:
+        lines += ["ZOTERO WRITE DIAGNOSTICS:", ""] + ["  {}".format(x) for x in WRITE_EVENTS] + [""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main():
+    if sys.version_info < (3, 8):
+        sys.exit("This tool requires Python 3.8 or newer.")
+
+    ap = argparse.ArgumentParser(
+        description="Fetch PubMed metadata, resolve references in Zotero, and write live Zotero citation fields into a DOCX."
+    )
+    ap.add_argument("docx")
+    ap.add_argument(
+        "--output-dir",
+        default=None,
+        help="Folder for generated files (default: same folder as the input DOCX).",
+    )
+    ap.add_argument(
+        "--no-ris",
+        action="store_true",
+        help="Do not create the optional PubMed RIS backup/export.",
+    )
+    ap.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Do not create the optional conversion report text file.",
+    )
+    ap.add_argument(
+        "--collection",
+        default=None,
+        help=(
+            "Put document references in this Zotero My Library collection. "
+            "A unique existing name/path is used automatically; if no collection matches, "
+            "a new top-level collection is created with this name."
+        ),
+    )
+    args = ap.parse_args()
+    input_path = Path(args.docx).expanduser().resolve()
+    if not input_path.exists() or input_path.suffix.lower() != ".docx":
+        sys.exit("Choose an existing .docx file.")
+
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else input_path.parent
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        sys.exit("Could not create/access output folder {}: {}".format(output_dir, exc))
+    if not output_dir.is_dir():
+        sys.exit("Output location is not a folder: {}".format(output_dir))
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_pmids, all_dois = all_identifiers_in_docx(input_path)
@@ -93,19 +175,4 @@
     print("Created {} live Zotero Word citation field(s).".format(field_count))
     print("Body citation locations converted: {}".format(body_stats["locations"]))
     print("Comment citation items added: {}".format(comment_stats["citations_added"]))
-    if body_stats["missing_pmids"] or body_stats["missing_dois"] or comment_stats["missing_pmids"] or comment_stats["missing_dois"]:
-        if report_path is not None:
-            print("Some unresolved identifiers were left unchanged; see the report.")
-        else:
-            print("Some unresolved identifiers were left unchanged.")
-    print("\nCreated:")
-    if full_ris_path:
-        print(full_ris_path)
-    print(output_path)
-    if report_path is not None:
-        print(report_path)
-    print("\nOriginal DOCX was not changed.")
-
-
-if __name__ == "__main__":
-    main()
+    if body_stats["missing_pmids"] or body_stats["missing
