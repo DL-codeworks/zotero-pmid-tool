@@ -52,7 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view v1.0.1 *> $null
+          gh release view v1.0.2 *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create v1.0.1 dist/ZoteroPMIDTool.exe --title "Zotero PMID Tool v1.0.1" --notes "Fixes the packaged Windows app failing with a missing core main function."
+            gh release create v1.0.2 dist/ZoteroPMIDTool.exe --title "Zotero PMID Tool v1.0.2" --notes "Makes inserted Zotero citations inherit the formatting of the preceding document text instead of falling back to Word's default font and size."
           }
