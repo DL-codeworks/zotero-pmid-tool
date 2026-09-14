@@ -16,8 +16,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Check out repository
@@ -65,35 +63,24 @@ jobs:
         run: |
           @'
           import pmid_docx_to_zotero as m
-
           a = m.ZoteroRef('AAAA1111', 'A (2020)', 'A', 'http://zotero.org/users/1/items/AAAA1111')
           b = m.ZoteroRef('BBBB2222', 'B (2021)', 'B', 'http://zotero.org/users/1/items/BBBB2222')
           pmids = {'23731077': a, '12402102': b}
 
-          one = [
-              '23731077', '(23731077)', '[23731077]', '{23731077}',
-              '(23731077]', '[23731077)', '{23731077]',
-              'PMID: 23731077', 'PMID 23731077', 'PMIDs: 23731077',
-              'PubMed ID: 23731077', '[PMID: 23731077]'
-          ]
+          one = ['23731077','(23731077)','[23731077]','{23731077}','(23731077]','[23731077)','{23731077]','PMID: 23731077','PMID 23731077','PMIDs: 23731077','PubMed ID: 23731077','[PMID: 23731077]']
           for sample in one:
               reps, mp, md, manual = m.find_replacements(sample, pmids, {})
               assert len(reps) == 1, (sample, reps)
               assert (reps[0].start, reps[0].end) == (0, len(sample)), (sample, reps[0].start, reps[0].end)
-              assert reps[0].identifiers == ['23731077']
+              assert reps[0].identifiers == ['23731077'], (sample, reps[0].identifiers)
               assert not mp and not md and not manual
 
-          grouped = [
-              '(23731077, 12402102)', '[23731077; 12402102]',
-              '(23731077, 12402102]', '[PMID 23731077, PMID 12402102}',
-              '23731077, 12402102', '23731077; 12402102',
-              'PMIDs: 23731077, 12402102'
-          ]
+          grouped = ['(23731077, 12402102)','[23731077; 12402102]','(23731077, 12402102]','[PMID 23731077, PMID 12402102}','23731077, 12402102','23731077; 12402102','PMIDs: 23731077, 12402102']
           for sample in grouped:
               reps, mp, md, manual = m.find_replacements(sample, pmids, {})
               assert len(reps) == 1, (sample, reps)
               assert (reps[0].start, reps[0].end) == (0, len(sample)), (sample, reps[0].start, reps[0].end)
-              assert reps[0].identifiers == ['23731077', '12402102']
+              assert reps[0].identifiers == ['23731077', '12402102'], (sample, reps[0].identifiers)
               assert not mp and not md and not manual
           '@ | python -
 
@@ -109,14 +96,3 @@ jobs:
           name: ZoteroPMIDTool-windows
           path: dist/ZoteroPMIDTool.exe
           if-no-files-found: error
-
-      - name: Publish Windows release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view v1.0.5 *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create v1.0.5 dist/ZoteroPMIDTool.exe --title "Zotero PMID Tool v1.0.5" --notes "Expands PMID placeholder handling to common bracket styles, mismatched brackets, PMID/PubMed labels, plural labels, and bare comma/semicolon PMID lists."
-          }
