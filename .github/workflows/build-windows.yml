@@ -45,7 +45,7 @@ jobs:
           if-no-files-found: error
 
       - name: Create initial release
-        if: github.event_name == 'push' && github.event.pull_request == null
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
