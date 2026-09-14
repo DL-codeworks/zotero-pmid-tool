@@ -1152,11 +1152,11 @@ def identifiers_in_text(text):
 def balanced_outer_spans(text):
     stack = []
     spans = []
-    pairs = {")": "(", "]": "["}
+    pairs = {")": "(", "]": "[", "}": "{"}
     for i, ch in enumerate(text):
-        if ch in "([":
+        if ch in "([{":
             stack.append((ch, i))
-        elif ch in ")]":
+        elif ch in ")]}":
             if stack and stack[-1][0] == pairs[ch]:
                 _, start = stack.pop()
                 if not stack:
@@ -1164,9 +1164,21 @@ def balanced_outer_spans(text):
     return spans
 
 
+def pmid_wrapper_spans(text):
+    """Return tolerant bracketed PMID groups, including mismatched bracket pairs."""
+    label = r"(?:PMIDs?|PubMed(?:\s+IDs?)?)"
+    pattern = re.compile(
+        r"(?P<open>[\(\[\{])\s*"
+        r"(?P<body>(?:" + label + r"\s*:?\s*)?\d{6,8}"
+        r"(?:\s*(?:[,;]\s*|\s+)(?:" + label + r"\s*:?\s*)?\d{6,8})*)"
+        r"\s*(?P<close>[\)\]\}])",
+        re.I,
+    )
+    return [(m.start(), m.end(), m.group("body")) for m in pattern.finditer(text)]
+
 def strip_identifiers(text):
     text = DOI_RE.sub(" ", text)
-    text = re.sub(r"\b(?:PMID|PubMed(?:\s+ID)?)\s*:\s*", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:PMIDs?|PubMed(?:\s+IDs?)?)\s*:?\s*", " ", text, flags=re.I)
     text = PMID_RE.sub(" ", text)
     return re.sub(r"[\s,;]+", "", text)
 
@@ -1272,9 +1284,33 @@ def find_replacements(text, pmid_map, doi_map):
     def overlaps(s, e):
         return any(s < r.end and e > r.start for r in replacements)
 
-    # Parenthetical/bracketed groups first. PMID-only, DOI-only, and mixed
-    # groups all become one Zotero citation field containing multiple items.
+    # Tolerant PMID-only wrappers first. These intentionally accept any
+    # standard bracket family and mismatched pairs such as (12345678].
+    # The wrapper is placeholder punctuation, so consume it with the PMID(s).
+    for start, end, body in pmid_wrapper_spans(text):
+        ids = identifiers_in_text(body)
+        if not ids:
+            continue
+        refs = []
+        missing = []
+        for _, _, kind, value in ids:
+            ref = ref_for(kind, value)
+            if ref:
+                refs.append(ref)
+            else:
+                missing.append((kind, value))
+        if missing:
+            for kind, value in missing:
+                (missing_pmids if kind == "pmid" else missing_dois).add(value)
+            protected.append((start, end))
+            continue
+        replacements.append(Replacement(start, end, refs, [v for _, _, _, v in ids]))
+
+    # Properly balanced groups can also contain DOI references or mixtures of
+    # DOI and PMID references. They become one Zotero citation field.
     for start, end in balanced_outer_spans(text):
+        if overlaps(start, end):
+            continue
         chunk = text[start:end]
         ids = identifiers_in_text(chunk)
         if not ids:
@@ -1302,12 +1338,16 @@ def find_replacements(text, pmid_map, doi_map):
         else:
             protected.append((start, end))
             manual.append(chunk)
-
     def inside_protected(pos):
         return any(s <= pos < e for s, e in protected)
 
-    # Explicit PMID clusters outside parentheses.
-    cluster_re = re.compile(r"\bPMID\s*:\s*(?P<body>\d{6,8}(?:\s*(?:[,;]\s*|\s+)\d{6,8})*)", re.I)
+    # Explicit PMID/PubMed labels outside brackets. A colon is optional and
+    # common plural forms are accepted.
+    cluster_re = re.compile(
+        r"\b(?:PMIDs?|PubMed(?:\s+IDs?)?)\s*:?\s*"
+        r"(?P<body>\d{6,8}(?:\s*(?:[,;]\s*|\s+)\d{6,8})*)",
+        re.I,
+    )
     for m in cluster_re.finditer(text):
         if overlaps(m.start(), m.end()) or inside_protected(m.start()):
             continue
@@ -1315,9 +1355,25 @@ def find_replacements(text, pmid_map, doi_map):
         refs = [pmid_map.get(p) for p in pmids]
         if any(r is None for r in refs):
             missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
+            protected.append((m.start(), m.end()))
             continue
         replacements.append(Replacement(m.start(), m.end(), refs, pmids))
 
+    # Bare comma/semicolon PMID lists are also a single citation, even when
+    # they are not wrapped in brackets.
+    bare_cluster_re = re.compile(
+        r"(?<!\d)(?P<body>\d{6,8}(?:\s*[,;]\s*\d{6,8})+)(?!\d)"
+    )
+    for m in bare_cluster_re.finditer(text):
+        if overlaps(m.start(), m.end()) or inside_protected(m.start()):
+            continue
+        pmids = PMID_RE.findall(m.group("body"))
+        refs = [pmid_map.get(p) for p in pmids]
+        if any(r is None for r in refs):
+            missing_pmids.update(p for p, r in zip(pmids, refs) if r is None)
+            protected.append((m.start(), m.end()))
+            continue
+        replacements.append(Replacement(m.start(), m.end(), refs, pmids))
     # Remaining standalone PMIDs and DOI strings.
     for start, end, kind, value in identifiers_in_text(text):
         if overlaps(start, end) or inside_protected(start):
