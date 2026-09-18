@@ -36,6 +36,7 @@ jobs:
         run: |
           @'
           import html
+          import json
           import pmid_docx_to_zotero as m
 
           comments = '<w:comments><w:comment w:id="1"><w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p><w:p w14:paraId="00000002"><w:r><w:t>23685858</w:t></w:r></w:p><w:p w14:paraId="00000003"><w:r><w:t>29479311</w:t></w:r></w:p></w:comment></w:comments>'
@@ -56,6 +57,16 @@ jobs:
           decoded = html.unescape(out)
           for ref in [existing] + extras:
               assert ref.uri in decoded
+
+          fields = m._zotero_citation_fields(out)
+          assert len(fields) == 1
+          payload = html.unescape(
+              out[fields[0]['payload_start']:fields[0]['payload_end']]
+          ).strip()
+          citation = json.loads(payload)
+          assert len(citation['citationItems']) == 4
+          assert 'formattedCitation' not in citation.get('properties', {})
+          assert 'plainCitation' not in citation.get('properties', {})
           '@ | python -
 
       - name: PMID syntax regression check
@@ -82,6 +93,17 @@ jobs:
               assert (reps[0].start, reps[0].end) == (0, len(sample)), (sample, reps[0].start, reps[0].end)
               assert reps[0].identifiers == ['23731077', '12402102'], (sample, reps[0].identifiers)
               assert not mp and not md and not manual
+
+          # Never interpret digits embedded in article numbers, DOIs, or words as PMIDs.
+          false_positive_samples = [
+              'CD002025',
+              'ABC23731077',
+              '23731077XYZ',
+              '10.1002/14651858.CD002025.pub5',
+          ]
+          for sample in false_positive_samples:
+              ids = m.identifiers_in_text(sample)
+              assert not [x for x in ids if x[2] == 'pmid'], (sample, ids)
           '@ | python -
 
       - name: Bibliography exclusion regression check
@@ -133,6 +155,11 @@ jobs:
               with zipfile.ZipFile(p, 'w') as z:
                   z.writestr('word/document.xml', doc_with_comment)
                   z.writestr('word/comments.xml', comments)
+              inventory = m.identifier_inventory_in_docx(p)
+              assert inventory['body_pmids'] == {'23731077'}, inventory
+              assert not inventory['body_dois'], inventory
+              assert not inventory['comment_pmids'], inventory
+              assert not inventory['comment_dois'], inventory
               found_pmids, found_dois = m.all_identifiers_in_docx(p)
               assert found_pmids == {'23731077'}, found_pmids
               assert not found_dois
