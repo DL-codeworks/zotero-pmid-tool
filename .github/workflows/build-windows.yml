@@ -69,6 +69,35 @@ jobs:
           assert 'plainCitation' not in citation.get('properties', {})
           '@ | python -
 
+      - name: Mixed existing/new citation paragraph regression check
+        shell: pwsh
+        run: |
+          @'
+          import pmid_docx_to_zotero as m
+
+          existing = m.ZoteroRef(
+              'EXIST090', 'Existing (2020)', 'Existing',
+              'http://zotero.org/users/1/items/EXIST090'
+          )
+          new_ref = m.ZoteroRef(
+              'NEW00001', 'New (2021)', 'New',
+              'http://zotero.org/users/1/items/NEW00001'
+          )
+          existing_field = m.build_word_field_xml([existing])
+          doc = (
+              '<w:document><w:body><w:p>'
+              '<w:r><w:t>Existing citation </w:t></w:r>'
+              + existing_field +
+              '<w:r><w:t> and later placeholder (22016195).</w:t></w:r>'
+              '</w:p></w:body></w:document>'
+          )
+          out, stats = m.patch_document_xml(doc, {'22016195': new_ref}, {})
+          assert stats['locations'] == 1, stats
+          assert stats['ids'] == ['22016195'], stats
+          assert out.count('ADDIN ZOTERO_ITEM CSL_CITATION') == 2
+          assert '22016195' not in m.visible_text(out)
+          '@ | python -
+
       - name: PMID syntax regression check
         shell: pwsh
         run: |
