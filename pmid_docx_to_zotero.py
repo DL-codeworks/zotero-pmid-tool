@@ -1580,6 +1580,25 @@ def _bibliography_comment_ids(document_xml, spans=None):
             out.add(int(m.group(1)))
     return out
 
+def _paragraph_placeholder_scan_text(paragraph_xml):
+    """Visible paragraph text with existing Zotero citation results masked out.
+
+    Masking rather than deleting keeps character offsets aligned with patch_paragraph,
+    so placeholders elsewhere in a paragraph containing existing Zotero citations can
+    still be converted safely.
+    """
+    citation_fields = _zotero_citation_fields(paragraph_xml)
+    pieces = []
+    for match in WT_RE.finditer(paragraph_xml):
+        value = html.unescape(match.group(2))
+        inside_citation = any(
+            match.start() < field["end"] and match.end() > field["start"]
+            for field in citation_fields
+        )
+        pieces.append(" " * len(value) if inside_citation else value)
+    return "".join(pieces)
+
+
 def patch_document_xml(xml, pmid_map, doi_map):
     pieces = []
     last = 0
@@ -1588,9 +1607,8 @@ def patch_document_xml(xml, pmid_map, doi_map):
     for pm in PARA_RE.finditer(xml):
         para = pm.group(0)
         pieces.append(xml[last:pm.start()])
-        if (not _range_overlaps_spans(pm.start(), pm.end(), bibliography_spans)
-                and "ADDIN ZOTERO_ITEM CSL_CITATION" not in para):
-            text = visible_text(para)
+        if not _range_overlaps_spans(pm.start(), pm.end(), bibliography_spans):
+            text = _paragraph_placeholder_scan_text(para)
             if PMID_RE.search(text) or DOI_RE.search(text):
                 reps, mp, md, manual = find_replacements(text, pmid_map, doi_map)
                 stats["missing_pmids"].update(mp)
