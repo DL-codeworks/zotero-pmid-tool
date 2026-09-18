@@ -27,6 +27,7 @@ A Windows tool for managing Zotero references in `.docx` documents. It automatic
 4. Optionally choose a Zotero collection, RIS export, or conversion report.
 5. Click **Convert Citations**.
 6. Open the newly created DOCX.
+7. In Word, use **Zotero → Refresh** to update the citations.
 
 ## Output
 
