@@ -25,7 +25,7 @@ ZOTERO_API = os.environ.get("ZOTERO_API", "http://localhost:23119/api")
 EUTILS_FETCH = os.environ.get("EUTILS_FETCH", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi")
 EUTILS_SEARCH = os.environ.get("EUTILS_SEARCH", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi")
 
-PMID_RE = re.compile(r"(?<!\d)(\d{6,8})(?!\d)")
+PMID_RE = re.compile(r"(?<!\w)(\d{6,8})(?!\w)")
 PMID_LABELED_RE = re.compile(r"\b(?:PMID|PubMed(?:\s+ID)?)\s*:?\s*(\d{6,8})\b", re.I)
 PUBMED_URL_RE = re.compile(r"https?://(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov/(\d{6,8})(?:/|$)", re.I)
 DOI_RE = re.compile(
@@ -226,6 +226,25 @@ def _payload_identifier(item):
     return title[:80] if title else "reference"
 
 
+def short_author_year(data):
+    """Return a concise first-author/year label for progress messages."""
+    author = "Unknown author"
+    for creator in data.get("creators") or []:
+        if creator.get("creatorType") in ("author", "bookAuthor", "editor", "contributor"):
+            name = (
+                creator.get("lastName")
+                or creator.get("name")
+                or creator.get("firstName")
+                or ""
+            ).strip()
+            if name:
+                author = name
+                break
+    match = re.search(r"\b(?:18|19|20)\d{2}\b", str(data.get("date") or ""))
+    year = match.group(0) if match else "n.d."
+    return "{}, {}".format(author, year)
+
+
 def _find_payload_in_zotero(item):
     pmid_map, doi_map, title_map, _ = load_zotero_index()
     for pmid in item_pmids(item):
@@ -261,14 +280,18 @@ def post_zotero_items(items, collection_key=None, max_attempts=3, timeout=60):
                 cols.append(collection_key)
             item["collections"] = cols
 
-        label = _payload_identifier(item)
+        identifier = _payload_identifier(item)
+        display = short_author_year(item)
         token = uuid.uuid4().hex
         done = False
 
         for attempt in range(1, max_attempts + 1):
-            write_event("Zotero write {}/{} for {} (timeout {}s)...".format(attempt, max_attempts, label, timeout))
+            if attempt > 1:
+                write_event("Retry {}/{}: adding {} to Zotero...".format(
+                    attempt, max_attempts, display
+                ))
             try:
-                obj, response_headers, status, elapsed = zotero_raw_request(
+                obj, _response_headers, status, _elapsed = zotero_raw_request(
                     "POST",
                     "/users/0/items",
                     payload=[item],
@@ -279,28 +302,26 @@ def post_zotero_items(items, collection_key=None, max_attempts=3, timeout=60):
                 )
             except RuntimeError as exc:
                 message = str(exc)
-                write_event("{}".format(message))
+                write_event("{} while adding {}.".format(message, display))
                 if "TIMEOUT" in message:
-                    write_event("The request outcome is ambiguous, so checking Zotero before retrying...")
+                    write_event("Checking Zotero before retrying because the write outcome is uncertain...")
                     try:
                         found = _find_payload_in_zotero(item)
                     except Exception as verify_exc:
                         found = None
                         write_event("Verification check also failed: {}".format(verify_exc))
                     if found:
-                        write_event("{} is present in Zotero; treating the timed-out write as successful.".format(label))
+                        write_event("Zotero confirmed {} after the timeout (key {}).".format(
+                            display, found.key
+                        ))
                         created += 1
                         done = True
                         break
                 if attempt < max_attempts:
-                    delay = 2 ** attempt
-                    write_event("Retrying {} in {}s.".format(label, delay))
-                    time.sleep(delay)
+                    time.sleep(2 ** attempt)
                     continue
-                failures.append((label, message))
+                failures.append((identifier, message))
                 break
-
-            write_event("Zotero answered HTTP {} in {:.2f}s for {}.".format(status, elapsed, label))
 
             if status == 401:
                 write_event("Zotero rejected the cached write authorization; requesting a fresh one.")
@@ -308,51 +329,47 @@ def post_zotero_items(items, collection_key=None, max_attempts=3, timeout=60):
                 key = authorize_zotero_write(server_id)
                 if attempt < max_attempts:
                     continue
-                failures.append((label, "HTTP 401 after reauthorization"))
+                failures.append((identifier, "HTTP 401 after reauthorization"))
                 break
 
             if status == 409:
-                write_event("Zotero reports the library is locked/busy (HTTP 409).")
+                write_event("Zotero library is locked/busy (HTTP 409).")
                 if attempt < max_attempts:
-                    delay = 2 ** attempt
-                    write_event("Waiting {}s before retrying {}.".format(delay, label))
-                    time.sleep(delay)
+                    time.sleep(2 ** attempt)
                     continue
-                failures.append((label, "HTTP 409 library locked"))
+                failures.append((identifier, "HTTP 409 library locked"))
                 break
 
             if status == 412:
-                # Reusing the same write token after a lost response can produce 412
-                # because Zotero already accepted the first request. Verify first.
-                write_event("Zotero returned HTTP 412; checking whether the earlier write already succeeded.")
                 try:
                     found = _find_payload_in_zotero(item)
                 except Exception as verify_exc:
                     found = None
-                    write_event("Verification check failed: {}".format(verify_exc))
+                    write_event("Verification check failed after HTTP 412: {}".format(verify_exc))
                 if found:
-                    write_event("{} is present in Zotero; no duplicate retry needed.".format(label))
+                    write_event("Zotero confirmed {} (key {}, HTTP 412 verification).".format(
+                        display, found.key
+                    ))
                     created += 1
                     done = True
                     break
                 token = uuid.uuid4().hex
                 if attempt < max_attempts:
                     continue
-                failures.append((label, "HTTP 412 and item not found after verification"))
+                failures.append((identifier, "HTTP 412 and item not found after verification"))
                 break
 
             if status >= 500:
-                write_event("Zotero returned a server error for {}: HTTP {} {}".format(label, status, obj))
+                write_event("Zotero server error while adding {} (HTTP {}).".format(display, status))
                 if attempt < max_attempts:
-                    delay = 2 ** attempt
-                    time.sleep(delay)
+                    time.sleep(2 ** attempt)
                     continue
-                failures.append((label, "HTTP {}: {}".format(status, obj)))
+                failures.append((identifier, "HTTP {}: {}".format(status, obj)))
                 break
 
             if status >= 400:
-                failures.append((label, "HTTP {}: {}".format(status, obj)))
-                write_event("Zotero rejected {}: HTTP {} {}".format(label, status, obj))
+                failures.append((identifier, "HTTP {}: {}".format(status, obj)))
+                write_event("Zotero rejected {} (HTTP {}).".format(display, status))
                 break
 
             success = {}
@@ -361,36 +378,43 @@ def post_zotero_items(items, collection_key=None, max_attempts=3, timeout=60):
                 success = obj.get("success") or obj.get("successful") or {}
                 failed = obj.get("failed") or {}
             if failed:
-                failures.append((label, "Zotero item failure: {}".format(failed)))
-                write_event("Zotero rejected {}: {}".format(label, failed))
+                failures.append((identifier, "Zotero item failure: {}".format(failed)))
+                write_event("Zotero rejected {}: {}".format(display, failed))
                 break
             if success:
+                created_key = _extract_created_key(obj) or "unknown"
                 created += 1
-                write_event("Added {} to Zotero.".format(label))
+                write_event("Zotero added {} (key {}, HTTP {}).".format(
+                    display, created_key, status
+                ))
                 done = True
                 break
 
-            # A successful HTTP response without a recognizable body is ambiguous.
-            write_event("Zotero returned HTTP {} but no recognizable item result; verifying library state.".format(status))
             try:
                 found = _find_payload_in_zotero(item)
             except Exception as verify_exc:
                 found = None
-                write_event("Verification check failed: {}".format(verify_exc))
+                write_event("Verification check failed after HTTP {}: {}".format(status, verify_exc))
             if found:
                 created += 1
-                write_event("{} is present in Zotero.".format(label))
+                write_event("Zotero confirmed {} (key {}, HTTP {}).".format(
+                    display, found.key, status
+                ))
                 done = True
                 break
             if attempt < max_attempts:
-                delay = 2 ** attempt
-                time.sleep(delay)
+                time.sleep(2 ** attempt)
                 continue
-            failures.append((label, "HTTP {} without success result, item not found".format(status)))
+            failures.append((
+                identifier,
+                "HTTP {} without success result, item not found".format(status),
+            ))
             break
 
-        if not done and failures and failures[-1][0] == label:
-            write_event("Giving up automatic import for {} after {} attempt(s); the rest of the document will continue.".format(label, max_attempts))
+        if not done and failures and failures[-1][0] == identifier:
+            write_event("Could not automatically add {}; continuing with the rest of the document.".format(
+                display
+            ))
 
     return created, failures
 
@@ -804,12 +828,10 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
     if not collection_key:
         return {"total": 0, "already": 0, "added": 0, "failed": []}
 
-    # Zotero collection keys are library-scoped. Validate the exact selected key
-    # in My Library before touching any item.
     selected = _get_collection_data(collection_key, "/users/0")
     if not selected:
         raise RuntimeError(
-            "Selected collection {!r} [key {}] is not present in My Library according to Zotero's /users/0/collections endpoint.".format(
+            "Selected collection {!r} [key {}] is not present in My Library according to Zotero.".format(
                 collection_path, collection_key
             )
         )
@@ -823,7 +845,7 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
     if not refs:
         return stats
 
-    print("\nEnsuring {} resolved document reference(s) are in My Library collection: {} [key {}]".format(
+    print("\nEnsuring {} resolved reference(s) are in collection: {} [key {}]".format(
         len(refs), collection_path, collection_key
     ))
     server_id = zotero_server_id()
@@ -832,8 +854,13 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
     api_key = zotero_write_key(server_id)
 
     for ref in refs:
+        display = short_author_year(ref.data)
         done = False
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                write_event('Retry {}/{}: adding {} to "{}"...'.format(
+                    attempt, max_attempts, display, collection_path
+                ))
             try:
                 data = _get_zotero_item_data(ref.key)
             except Exception as exc:
@@ -851,19 +878,16 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
 
             version = data.get("version")
             if version is None:
-                stats["failed"].append((ref.key, "item has no Zotero version; cannot make a safe PATCH"))
+                stats["failed"].append((
+                    ref.key,
+                    "item has no Zotero version; cannot make a safe PATCH",
+                ))
                 break
 
-            # Official Zotero PATCH semantics: arrays are complete lists. Preserve
-            # every existing collection key and append the selected one. Use the
-            # item's current version as If-Unmodified-Since-Version.
             payload = {"collections": collections + [collection_key]}
             headers = {"If-Unmodified-Since-Version": str(version)}
-            write_event("Adding Zotero item {} to collection {} [key {}] (attempt {}/{})...".format(
-                ref.key, collection_path, collection_key, attempt, max_attempts
-            ))
             try:
-                obj, response_headers, status, elapsed = zotero_raw_request(
+                obj, _response_headers, status, _elapsed = zotero_raw_request(
                     "PATCH",
                     "/users/0/items/{}".format(ref.key),
                     payload=payload,
@@ -873,13 +897,14 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
                     timeout=timeout,
                 )
             except RuntimeError as exc:
-                write_event(str(exc))
-                # Timeout is ambiguous: verify membership before retrying.
+                write_event("{} while adding {} to collection.".format(exc, display))
                 try:
                     verify = _get_zotero_item_data(ref.key)
                     if collection_key in (verify.get("collections") or []):
                         stats["added"] += 1
-                        write_event("Collection membership verified after timeout for {}.".format(ref.key))
+                        write_event('Zotero confirmed {} in "{}" after the timeout (key {}).'.format(
+                            display, collection_path, ref.key
+                        ))
                         done = True
                         break
                 except Exception:
@@ -890,46 +915,54 @@ def ensure_refs_in_collection(refs, collection_key, collection_path, max_attempt
                 stats["failed"].append((ref.key, str(exc)))
                 break
 
-            write_event("Zotero answered HTTP {} in {:.2f}s while adding {} to collection.".format(status, elapsed, ref.key))
             if status == 401:
                 clear_cached_write_key()
                 api_key = authorize_zotero_write(server_id)
                 if attempt < max_attempts:
                     continue
+                stats["failed"].append((ref.key, "HTTP 401 after reauthorization"))
+                break
             elif status == 204:
                 verify = _get_zotero_item_data(ref.key)
                 if collection_key in (verify.get("collections") or []):
                     stats["added"] += 1
+                    write_event('Zotero added {} to "{}" (key {}, HTTP 204).'.format(
+                        display, collection_path, ref.key
+                    ))
                     done = True
                     break
-                write_event("Zotero returned 204, but item {} did not contain collection key {} when read back.".format(ref.key, collection_key))
+                write_event("Zotero returned HTTP 204, but collection membership could not be verified for {}.".format(
+                    display
+                ))
             elif status == 412 and attempt < max_attempts:
-                # Item changed since GET. Re-read fresh version and try again.
-                write_event("Item {} changed during update (HTTP 412); re-reading current version.".format(ref.key))
+                write_event("{} changed during the update (HTTP 412); re-reading it before retrying.".format(
+                    display
+                ))
                 time.sleep(1)
                 continue
             elif status == 409 and attempt < max_attempts:
-                write_event("Zotero reports My Library is locked/busy (HTTP 409).")
+                write_event("Zotero library is locked/busy (HTTP 409).")
                 time.sleep(2 ** attempt)
                 continue
             else:
                 stats["failed"].append((
                     ref.key,
-                    "HTTP {} while adding collection {!r} [key {}]: {}".format(status, collection_path, collection_key, obj),
+                    "HTTP {} while adding collection {!r}: {}".format(
+                        status, collection_path, obj
+                    ),
                 ))
                 break
 
         if not done and not any(k == ref.key for k, _ in stats["failed"]):
             stats["failed"].append((ref.key, "collection membership could not be verified"))
 
-    print("Collection result for this document: {} already there, {} added, {} failed.".format(
-        stats["already"], stats["added"], len(stats["failed"])
+    print('Collection "{}": {} already there, {} added, {} failed.'.format(
+        collection_path, stats["already"], stats["added"], len(stats["failed"])
     ))
     if stats["failed"]:
         for key, reason in stats["failed"]:
             print("  Could not add {}: {}".format(key, reason))
     return stats
-
 
 def item_label(data):
     creators = [c for c in (data.get("creators") or []) if c.get("creatorType") in ("author", "bookAuthor", "editor", "contributor")]
@@ -1362,7 +1395,7 @@ def find_replacements(text, pmid_map, doi_map):
     # Bare comma/semicolon PMID lists are also a single citation, even when
     # they are not wrapped in brackets.
     bare_cluster_re = re.compile(
-        r"(?<!\d)(?P<body>\d{6,8}(?:\s*[,;]\s*\d{6,8})+)(?!\d)"
+        r"(?<!\w)(?P<body>\d{6,8}(?:\s*[,;]\s*\d{6,8})+)(?!\w)"
     )
     for m in bare_cluster_re.finditer(text):
         if overlaps(m.start(), m.end()) or inside_protected(m.start()):
@@ -1706,6 +1739,10 @@ def _merge_refs_into_citation_field(document_xml, field, refs):
         added += 1
     if not added:
         return document_xml, 0
+    properties = citation_data.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("formattedCitation", None)
+        properties.pop("plainCitation", None)
     new_payload = escape_xml_text(json.dumps(citation_data, ensure_ascii=False, separators=(",", ":")))
     document_xml = document_xml[:field["payload_start"]] + new_payload + document_xml[field["payload_end"]:]
     return document_xml, added
@@ -1747,6 +1784,9 @@ def add_comment_citations_and_replies(parts, pmid_map, doi_map):
         "replies": 0,
         "citations_added": 0,
         "comments_updated": 0,
+        "merged_items": 0,
+        "standalone_items": 0,
+        "standalone_fields": 0,
         "pmids": set(),
         "missing_pmids": set(),
         "missing_dois": set(),
@@ -1807,14 +1847,21 @@ def add_comment_citations_and_replies(parts, pmid_map, doi_map):
                 seen.add(ref.key)
                 unique_refs.append(ref)
 
+        before_field_count = len(_zotero_citation_fields(document_xml))
         document_xml, added_count = append_refs_at_comment_anchor(
             document_xml, rec["id"], unique_refs
         )
         if added_count == 0:
             continue
+        after_field_count = len(_zotero_citation_fields(document_xml))
 
         stats["citations_added"] += added_count
         stats["comments_updated"] += 1
+        if after_field_count > before_field_count:
+            stats["standalone_items"] += added_count
+            stats["standalone_fields"] += after_field_count - before_field_count
+        else:
+            stats["merged_items"] += added_count
 
         # The citation itself is the important part. A threaded reply is optional:
         # add it only when this DOCX already has the modern Word comment metadata.
@@ -1862,17 +1909,21 @@ def add_comment_citations_and_replies(parts, pmid_map, doi_map):
         parts["word/commentsExtensible.xml"] = comments_ext
     return parts, stats
 
-def all_identifiers_in_docx(path):
-    """Collect PMID/DOI placeholders while excluding bibliography/reference text."""
-    pmids = set()
-    dois = set()
+def identifier_inventory_in_docx(path):
+    """Collect citation identifiers outside the bibliography, split by body/comments."""
+    result = {
+        "body_pmids": set(),
+        "body_dois": set(),
+        "comment_pmids": set(),
+        "comment_dois": set(),
+    }
 
-    def collect_from_text(text):
+    def collect_from_text(text, pmid_target, doi_target):
         for _, _, kind, value in identifiers_in_text(text):
             if kind == "pmid":
-                pmids.add(value)
+                pmid_target.add(value)
             else:
-                dois.add(normalize_doi(value))
+                doi_target.add(normalize_doi(value))
 
     with zipfile.ZipFile(path, "r") as z:
         bibliography_comment_ids = set()
@@ -1883,16 +1934,32 @@ def all_identifiers_in_docx(path):
             for pm in PARA_RE.finditer(xml):
                 if _range_overlaps_spans(pm.start(), pm.end(), bibliography_spans):
                     continue
-                collect_from_text(visible_text(pm.group(0)))
+                collect_from_text(
+                    visible_text(pm.group(0)),
+                    result["body_pmids"],
+                    result["body_dois"],
+                )
 
         if "word/comments.xml" in z.namelist():
             comments_xml = z.read("word/comments.xml").decode("utf-8", errors="replace")
             for cm in COMMENT_RE.finditer(comments_xml):
                 if int(cm.group("id")) in bibliography_comment_ids:
                     continue
-                collect_from_text(comment_visible_text(cm.group("body")))
+                collect_from_text(
+                    comment_visible_text(cm.group("body")),
+                    result["comment_pmids"],
+                    result["comment_dois"],
+                )
 
-    return pmids, dois
+    return result
+
+
+def all_identifiers_in_docx(path):
+    inventory = identifier_inventory_in_docx(path)
+    return (
+        inventory["body_pmids"] | inventory["comment_pmids"],
+        inventory["body_dois"] | inventory["comment_dois"],
+    )
 
 def docx_has_zotero_preferences(path):
     try:
@@ -2288,9 +2355,39 @@ def report_document_match_status(all_pmids, all_dois, pmid_map, doi_map):
     ))
 
 
+def resolved_document_refs(all_pmids, all_dois, pmid_map, doi_map):
+    refs = []
+    seen = set()
+    for pmid in sorted(all_pmids, key=int):
+        ref = pmid_map.get(pmid)
+        if ref is not None and ref.key not in seen:
+            seen.add(ref.key)
+            refs.append(ref)
+    for doi in sorted(all_dois):
+        ref = doi_map.get(doi)
+        if ref is not None and ref.key not in seen:
+            seen.add(ref.key)
+            refs.append(ref)
+    return refs
+
+
+def document_reference_stats(all_pmids, all_dois, pmid_map, doi_map, initial_keys):
+    refs = resolved_document_refs(all_pmids, all_dois, pmid_map, doi_map)
+    initial_keys = set(initial_keys or ())
+    existing_refs = [ref for ref in refs if ref.key in initial_keys]
+    new_refs = [ref for ref in refs if ref.key not in initial_keys]
+    return {
+        "total": len(refs),
+        "existing": len(existing_refs),
+        "new": len(new_refs),
+        "new_refs": new_refs,
+    }
+
+
 def resolve_document_references(all_pmids, all_dois, pubmed_articles, requested_collection=None):
     """Resolve only references in this DOCX and robustly import missing ones."""
-    pmid_map, doi_map, title_map, _ = load_zotero_index()
+    pmid_map, doi_map, title_map, initial_refs = load_zotero_index()
+    initial_keys = {ref.key for ref in initial_refs}
     report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
 
     # Collection choice applies to ALL resolved references used by this document,
@@ -2417,25 +2514,21 @@ def resolve_document_references(all_pmids, all_dois, pubmed_articles, requested_
 
     report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
 
+    document_refs = resolved_document_refs(all_pmids, all_dois, pmid_map, doi_map)
+    resolution = document_reference_stats(
+        all_pmids, all_dois, pmid_map, doi_map, initial_keys
+    )
+    print("Resolved Zotero references: {} unique ({} already in Zotero, {} added this run).".format(
+        resolution["total"], resolution["existing"], resolution["new"]
+    ))
+
     if collection_key:
-        document_refs = []
-        seen_keys = set()
-        for pmid in all_pmids:
-            ref = pmid_map.get(pmid)
-            if ref is not None and ref.key not in seen_keys:
-                seen_keys.add(ref.key)
-                document_refs.append(ref)
-        for doi in all_dois:
-            ref = doi_map.get(doi)
-            if ref is not None and ref.key not in seen_keys:
-                seen_keys.add(ref.key)
-                document_refs.append(ref)
         try:
             ensure_refs_in_collection(document_refs, collection_key, collection_path)
         except Exception as exc:
             write_event("Collection assignment warning: {}".format(exc))
 
-    return pmid_map, doi_map, doi_metadata, no_pubmed, collection_path
+    return pmid_map, doi_map, doi_metadata, no_pubmed, collection_path, initial_keys
 
 def write_pubmed_ris(path, pmids, article_map):
     records = []
@@ -2480,14 +2573,13 @@ def rewrite_docx(input_path, output_path, pmid_map, doi_map):
             parts[name] = raw[name].decode("utf-8")
 
     old_doc = parts["word/document.xml"]
+    preexisting_field_count = old_doc.count("ADDIN ZOTERO_ITEM CSL_CITATION")
     new_doc, body_stats = patch_document_xml(old_doc, pmid_map, doi_map)
-    # Everything before the document body must remain byte-for-byte unchanged.
     if old_doc.split("<w:body>", 1)[0] != new_doc.split("<w:body>", 1)[0]:
         raise RuntimeError("Safety check failed: Word XML namespace/header changed.")
     parts["word/document.xml"] = new_doc
     parts, comment_stats = add_comment_citations_and_replies(parts, pmid_map, doi_map)
 
-    # Structural XML validation before writing the ZIP.
     ET.fromstring(parts["word/document.xml"].encode("utf-8"))
     if "word/comments.xml" in parts:
         ET.fromstring(parts["word/comments.xml"].encode("utf-8"))
@@ -2497,8 +2589,6 @@ def rewrite_docx(input_path, output_path, pmid_map, doi_map):
             data = parts[name].encode("utf-8") if name in parts else raw[name]
             zout.writestr(name, data)
 
-    # Re-open exactly what was written and verify it is a valid DOCX ZIP with
-    # live Zotero Word citation fields, not plain marker text.
     with zipfile.ZipFile(output_path, "r") as test_zip:
         bad = test_zip.testzip()
         if bad:
@@ -2506,37 +2596,66 @@ def rewrite_docx(input_path, output_path, pmid_map, doi_map):
         out_doc = test_zip.read("word/document.xml").decode("utf-8")
         field_count = out_doc.count("ADDIN ZOTERO_ITEM CSL_CITATION")
         if body_stats["locations"] and field_count < body_stats["locations"]:
-            raise RuntimeError("Citation field validation failed: expected at least {} live fields, found {}.".format(body_stats["locations"], field_count))
+            raise RuntimeError(
+                "Citation field validation failed: expected at least {} live fields, found {}.".format(
+                    body_stats["locations"], field_count
+                )
+            )
 
-    return body_stats, comment_stats, field_count
+    field_stats = {
+        "preexisting": preexisting_field_count,
+        "created": max(0, field_count - preexisting_field_count),
+        "total": field_count,
+    }
+    return body_stats, comment_stats, field_stats
 
-
-def write_report(path, input_path, output_path, body_stats, comment_stats, field_count, full_ris_path=None, pubmed_records=0, import_collection_path=None):
+def write_report(path, input_path, output_path, body_stats, comment_stats, field_stats,
+                 full_ris_path=None, pubmed_records=0, import_collection_path=None,
+                 resolution_stats=None):
+    resolution_stats = resolution_stats or {"total": 0, "existing": 0, "new": 0}
     lines = [
         "DOCX -> live Zotero citation report", "=" * 36, "",
         "Input:  {}".format(input_path), "Output: {}".format(output_path),
         "PubMed RIS: {}".format(full_ris_path if full_ris_path else "not created"),
         "PubMed records fetched: {}".format(pubmed_records),
-        "Document reference collection: {}".format(import_collection_path if import_collection_path else "unchanged"), "",
-        "Live Zotero Word fields in output: {}".format(field_count),
-        "Body citation locations converted: {}".format(body_stats["locations"]),
+        "Document reference collection: {}".format(
+            import_collection_path if import_collection_path else "unchanged"
+        ), "",
+        "Zotero citation fields in output: {}".format(field_stats["total"]),
+        "Pre-existing Zotero citation fields: {}".format(field_stats["preexisting"]),
+        "Citation fields created by this run: {}".format(field_stats["created"]),
+        "Body placeholder locations converted: {}".format(body_stats["locations"]),
         "Unique body identifiers converted: {}".format(len(set(body_stats["ids"]))),
-        "Comment citation items added:       {}".format(comment_stats["citations_added"]),
-        "Comments updated:                   {}".format(comment_stats["comments_updated"]),
-        "Threaded reply comments added:      {}".format(comment_stats["replies"]), "",
+        "Comment reference items added: {}".format(comment_stats["citations_added"]),
+        "  Merged into existing citations: {}".format(comment_stats["merged_items"]),
+        "  Added in new citation fields: {}".format(comment_stats["standalone_items"]),
+        "Comments updated: {}".format(comment_stats["comments_updated"]),
+        "Threaded reply comments added: {}".format(comment_stats["replies"]), "",
+        "Unique Zotero references used by placeholders/comments: {}".format(
+            resolution_stats["total"]
+        ),
+        "Already in Zotero before this run: {}".format(resolution_stats["existing"]),
+        "Added to Zotero this run: {}".format(resolution_stats["new"]), "",
     ]
     if body_stats["manual"]:
-        lines += ["LEFT FOR MANUAL REVIEW:", ""] + ["  {}".format(x) for x in body_stats["manual"]] + [""]
+        lines += ["LEFT FOR MANUAL REVIEW:", ""] + [
+            "  {}".format(x) for x in body_stats["manual"]
+        ] + [""]
     unresolved_pmids = set(body_stats["missing_pmids"]) | set(comment_stats["missing_pmids"])
     unresolved_dois = set(body_stats["missing_dois"]) | set(comment_stats["missing_dois"])
     if unresolved_pmids:
-        lines += ["UNRESOLVED PMIDs LEFT UNCHANGED:", ""] + ["  {}".format(p) for p in sorted(unresolved_pmids, key=int)] + [""]
+        lines += ["UNRESOLVED PMIDs LEFT UNCHANGED:", ""] + [
+            "  {}".format(p) for p in sorted(unresolved_pmids, key=int)
+        ] + [""]
     if unresolved_dois:
-        lines += ["UNRESOLVED DOIs LEFT UNCHANGED:", ""] + ["  {}".format(d) for d in sorted(unresolved_dois)] + [""]
+        lines += ["UNRESOLVED DOIs LEFT UNCHANGED:", ""] + [
+            "  {}".format(d) for d in sorted(unresolved_dois)
+        ] + [""]
     if WRITE_EVENTS:
-        lines += ["ZOTERO WRITE DIAGNOSTICS:", ""] + ["  {}".format(x) for x in WRITE_EVENTS] + [""]
+        lines += ["ZOTERO WRITE DIAGNOSTICS:", ""] + [
+            "  {}".format(x) for x in WRITE_EVENTS
+        ] + [""]
     path.write_text("\n".join(lines), encoding="utf-8")
-
 
 def main():
     if sys.version_info < (3, 8):
@@ -2584,8 +2703,21 @@ def main():
         sys.exit("Output location is not a folder: {}".format(output_dir))
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    all_pmids, all_dois = all_identifiers_in_docx(input_path)
-    print("Found in this document/comments: {} PMID(s), {} DOI(s).".format(len(all_pmids), len(all_dois)))
+    inventory = identifier_inventory_in_docx(input_path)
+    all_pmids = inventory["body_pmids"] | inventory["comment_pmids"]
+    all_dois = inventory["body_dois"] | inventory["comment_dois"]
+
+    print("Found citation identifiers outside the bibliography:")
+    print("  Body: {} PMID(s), {} DOI(s).".format(
+        len(inventory["body_pmids"]), len(inventory["body_dois"])
+    ))
+    print("  Comments: {} PMID(s), {} DOI(s).".format(
+        len(inventory["comment_pmids"]), len(inventory["comment_dois"])
+    ))
+    print("  Unique total: {} PMID(s), {} DOI(s).".format(
+        len(all_pmids), len(all_dois)
+    ))
+
     pubmed_articles = {}
     full_ris_path = None
     pubmed_record_count = 0
@@ -2611,16 +2743,20 @@ def main():
 
     print("\nResolving references against Zotero...")
     import_collection_path = None
+    initial_keys = set()
     try:
-        pmid_map, doi_map, doi_metadata, no_pubmed, import_collection_path = resolve_document_references(
+        (
+            pmid_map, doi_map, doi_metadata, no_pubmed,
+            import_collection_path, initial_keys,
+        ) = resolve_document_references(
             all_pmids, all_dois, pubmed_articles, requested_collection=args.collection
         )
     except CollectionSelectionError as exc:
         sys.exit("Collection selection failed: {}".format(exc))
     except Exception as exc:
         print("Automatic Zotero resolution warning: {}".format(exc))
-        # Reads may still work even if an import failed.
-        pmid_map, doi_map, _, _ = load_zotero_index()
+        pmid_map, doi_map, _, refs = load_zotero_index()
+        initial_keys = {ref.key for ref in refs}
         doi_metadata = {}
         no_pubmed = []
         import_collection_path = None
@@ -2628,11 +2764,10 @@ def main():
     missing_pmids = set(p for p in all_pmids if p not in pmid_map)
     missing_dois = set(d for d in all_dois if d not in doi_map)
 
-    # Never force a manual import. The user can re-check after fixing Zotero, or
-    # ignore unresolved identifiers and still get a finished DOCX. Unresolved
-    # citation groups are left exactly as they were in the source document.
     while missing_pmids or missing_dois:
-        print("\n{} reference identifier(s) remain unresolved.".format(len(missing_pmids) + len(missing_dois)))
+        print("\n{} reference identifier(s) remain unresolved.".format(
+            len(missing_pmids) + len(missing_dois)
+        ))
         for p in sorted(missing_pmids, key=int):
             title = article_title(pubmed_articles.get(p)) if pubmed_articles.get(p) is not None else ""
             print("  PMID {}{}".format(p, " - " + title if title else ""))
@@ -2647,22 +2782,31 @@ def main():
         if answer in ("q", "quit"):
             return
         if answer in ("r", "recheck"):
-            pmid_map, doi_map = refresh_document_maps(all_pmids, all_dois, pubmed_articles, doi_metadata)
+            pmid_map, doi_map = refresh_document_maps(
+                all_pmids, all_dois, pubmed_articles, doi_metadata
+            )
             report_document_match_status(all_pmids, all_dois, pmid_map, doi_map)
             missing_pmids = set(p for p in all_pmids if p not in pmid_map)
             missing_dois = set(d for d in all_dois if d not in doi_map)
             continue
         print("Unknown choice; use I, R, or Q.")
 
+    resolution_stats = document_reference_stats(
+        all_pmids, all_dois, pmid_map, doi_map, initial_keys
+    )
+
     output_path = output_dir / "{}_zotero_citations_{}.docx".format(input_path.stem, stamp)
     report_path = None if args.no_report else output_dir / "{}_zotero_citations_{}_REPORT.txt".format(input_path.stem, stamp)
 
     try:
-        body_stats, comment_stats, field_count = rewrite_docx(input_path, output_path, pmid_map, doi_map)
+        body_stats, comment_stats, field_stats = rewrite_docx(
+            input_path, output_path, pmid_map, doi_map
+        )
         if report_path is not None:
             write_report(
                 report_path, input_path, output_path, body_stats, comment_stats,
-                field_count, full_ris_path, pubmed_record_count, import_collection_path,
+                field_stats, full_ris_path, pubmed_record_count,
+                import_collection_path, resolution_stats,
             )
     except Exception as exc:
         if output_path.exists():
@@ -2673,14 +2817,35 @@ def main():
         sys.exit("Conversion failed: {}".format(exc))
 
     print("\nDONE")
-    print("Created {} live Zotero Word citation field(s).".format(field_count))
-    print("Body citation locations converted: {}".format(body_stats["locations"]))
-    print("Comment citation items added: {}".format(comment_stats["citations_added"]))
+    print("Body placeholder locations converted: {}".format(body_stats["locations"]))
+    print("Unique body identifiers converted: {}".format(len(set(body_stats["ids"]))))
+    print("Comment references added: {} across {} comment(s).".format(
+        comment_stats["citations_added"], comment_stats["comments_updated"]
+    ))
+    if comment_stats["merged_items"]:
+        print("  {} merged into existing Zotero citation(s).".format(
+            comment_stats["merged_items"]
+        ))
+    if comment_stats["standalone_items"]:
+        print("  {} added in {} new Zotero citation field(s).".format(
+            comment_stats["standalone_items"], comment_stats["standalone_fields"]
+        ))
+    print("Zotero citation fields in output: {} total ({} pre-existing, {} created by this run).".format(
+        field_stats["total"], field_stats["preexisting"], field_stats["created"]
+    ))
+    print("Zotero library references used by placeholders/comments: {} unique ({} already present, {} added this run).".format(
+        resolution_stats["total"], resolution_stats["existing"], resolution_stats["new"]
+    ))
+    if resolution_stats["new_refs"]:
+        print("Added to Zotero this run:")
+        for ref in resolution_stats["new_refs"]:
+            print("  {} (key {})".format(short_author_year(ref.data), ref.key))
     if body_stats["missing_pmids"] or body_stats["missing_dois"] or comment_stats["missing_pmids"] or comment_stats["missing_dois"]:
         if report_path is not None:
             print("Some unresolved identifiers were left unchanged; see the report.")
         else:
             print("Some unresolved identifiers were left unchanged.")
+
     print("\nCreated:")
     if full_ris_path:
         print(full_ris_path)
@@ -2688,7 +2853,6 @@ def main():
     if report_path is not None:
         print(report_path)
     print("\nOriginal DOCX was not changed.")
-
 
 if __name__ == "__main__":
     main()
