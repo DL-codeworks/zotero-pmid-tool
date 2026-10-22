@@ -1638,11 +1638,39 @@ def comment_visible_text(body):
 
 
 def comment_records(comments_xml, comments_extended_xml):
+    """Return Word comments with thread and resolved-state metadata.
+
+    Modern Word stores the resolved flag in commentsExtended.xml as
+    w15:done="1". A resolved top-level comment resolves its thread, so replies
+    beneath a resolved parent are treated as resolved even if their own flag is
+    absent.
+    """
     parent_by_para = {}
-    for m in re.finditer(r'<w15:commentEx\b[^>]*\bw15:paraId="([0-9A-Fa-f]{8})"[^>]*>', comments_extended_xml):
+    done_by_para = {}
+    for m in re.finditer(
+        r'<w15:commentEx\b[^>]*\bw15:paraId="([0-9A-Fa-f]{8})"[^>]*>',
+        comments_extended_xml,
+    ):
         tag = m.group(0)
+        para_id = m.group(1).upper()
         p = re.search(r'\bw15:paraIdParent="([0-9A-Fa-f]{8})"', tag)
-        parent_by_para[m.group(1).upper()] = p.group(1).upper() if p else None
+        done = re.search(r'\bw15:done="([^"]+)"', tag, re.I)
+        parent_by_para[para_id] = p.group(1).upper() if p else None
+        done_by_para[para_id] = (
+            done.group(1).strip().casefold() in ("1", "true", "on")
+            if done else False
+        )
+
+    def thread_is_resolved(para_id):
+        seen = set()
+        current = para_id
+        while current and current not in seen:
+            seen.add(current)
+            if done_by_para.get(current, False):
+                return True
+            current = parent_by_para.get(current)
+        return False
+
     records = []
     for m in COMMENT_RE.finditer(comments_xml):
         body = m.group("body")
@@ -1655,6 +1683,7 @@ def comment_records(comments_xml, comments_extended_xml):
             "text": comment_visible_text(body),
             "last_para": last_para,
             "is_reply": bool(parent_by_para.get(last_para)),
+            "is_resolved": thread_is_resolved(last_para),
         })
     return records
 
@@ -1835,7 +1864,7 @@ def add_comment_citations_and_replies(parts, pmid_map, doi_map):
     }
 
     for rec in records:
-        if rec["is_reply"] or rec["id"] in bibliography_comment_ids:
+        if rec["is_reply"] or rec["is_resolved"] or rec["id"] in bibliography_comment_ids:
             continue
 
         ids = identifiers_in_text(rec["text"])
@@ -1960,11 +1989,21 @@ def identifier_inventory_in_docx(path):
 
         if "word/comments.xml" in z.namelist():
             comments_xml = z.read("word/comments.xml").decode("utf-8", errors="replace")
-            for cm in COMMENT_RE.finditer(comments_xml):
-                if int(cm.group("id")) in bibliography_comment_ids:
+            comments_extended_xml = (
+                z.read("word/commentsExtended.xml").decode("utf-8", errors="replace")
+                if "word/commentsExtended.xml" in z.namelist() else ""
+            )
+            for rec in comment_records(comments_xml, comments_extended_xml):
+                # Only actionable, unresolved top-level comments contribute
+                # reference identifiers. Replies and resolved threads are ignored.
+                if (
+                    rec["is_reply"]
+                    or rec["is_resolved"]
+                    or rec["id"] in bibliography_comment_ids
+                ):
                     continue
                 collect_from_text(
-                    comment_visible_text(cm.group("body")),
+                    rec["text"],
                     result["comment_pmids"],
                     result["comment_dois"],
                 )
