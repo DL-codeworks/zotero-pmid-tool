@@ -39,11 +39,37 @@ jobs:
           @'
           import html
           import json
+          import tempfile
+          import zipfile
+          from pathlib import Path
           import pmid_docx_to_zotero as m
 
           comments = '<w:comments><w:comment w:id="1"><w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p><w:p w14:paraId="00000002"><w:r><w:t>23685858</w:t></w:r></w:p><w:p w14:paraId="00000003"><w:r><w:t>29479311</w:t></w:r></w:p></w:comment></w:comments>'
           recs = m.comment_records(comments, '')
           assert recs[0]['text'] == '12402102\n23685858\n29479311'
+          assert not recs[0]['is_resolved']
+
+          resolved_ex = '<w15:commentsEx><w15:commentEx w15:paraId="00000001" w15:done="1"/></w15:commentsEx>'
+          resolved = m.comment_records(comments, resolved_ex)
+          assert resolved[0]['is_resolved']
+
+          # A resolved parent resolves the whole thread even if the reply does
+          # not carry its own done flag.
+          threaded_comments = (
+              '<w:comments>'
+              '<w:comment w:id="1"><w:p w14:paraId="00000001"><w:r><w:t>12402102</w:t></w:r></w:p></w:comment>'
+              '<w:comment w:id="2"><w:p w14:paraId="00000002"><w:r><w:t>23685858</w:t></w:r></w:p></w:comment>'
+              '</w:comments>'
+          )
+          threaded_ex = (
+              '<w15:commentsEx>'
+              '<w15:commentEx w15:paraId="00000001" w15:done="1"/>'
+              '<w15:commentEx w15:paraId="00000002" w15:paraIdParent="00000001" w15:done="0"/>'
+              '</w15:commentsEx>'
+          )
+          threaded = m.comment_records(threaded_comments, threaded_ex)
+          assert threaded[0]['is_resolved']
+          assert threaded[1]['is_reply'] and threaded[1]['is_resolved']
 
           existing = m.ZoteroRef('REF00090', 'Existing (2020)', 'Existing', 'http://zotero.org/users/1/items/REF00090')
           extras = [
@@ -69,6 +95,17 @@ jobs:
           assert len(citation['citationItems']) == 4
           assert 'formattedCitation' not in citation.get('properties', {})
           assert 'plainCitation' not in citation.get('properties', {})
+          # Resolved comments must not contribute citation identifiers during discovery.
+          with tempfile.TemporaryDirectory() as td:
+              p = Path(td) / 'resolved-comment.docx'
+              doc = '<w:document><w:body><w:p><w:commentRangeStart w:id="1"/><w:r><w:t>Text</w:t></w:r><w:commentRangeEnd w:id="1"/></w:p></w:body></w:document>'
+              with zipfile.ZipFile(p, 'w') as z:
+                  z.writestr('word/document.xml', doc)
+                  z.writestr('word/comments.xml', comments)
+                  z.writestr('word/commentsExtended.xml', resolved_ex)
+              inv = m.identifier_inventory_in_docx(p)
+              assert not inv['comment_pmids'], inv
+              assert not inv['comment_dois'], inv
           '@ | python -
 
       - name: Mixed existing/new citation paragraph regression check
