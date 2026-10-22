@@ -16,6 +16,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Check out repository
@@ -206,3 +208,15 @@ jobs:
           name: ZoteroPMIDTool-windows
           path: dist/ZoteroPMIDTool.exe
           if-no-files-found: error
+
+      - name: Publish current Windows build
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view current *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete current --yes --cleanup-tag
+          }
+          gh release create current dist/ZoteroPMIDTool.exe --target "${{ github.sha }}" --title "Current Windows build" --notes "Rolling build from the current main branch. Replaced automatically after tested source changes." --latest
